@@ -90,9 +90,13 @@ pub fn scan_rust_source(
 
         let source_location = detected_node.source_location;
         let logical_name = detected_node.logical_name;
+        let node_id = EntityId::new(format!(
+            "node:{}:{source_path}:{}",
+            package.name, detected_node.variable_name
+        ));
 
         nodes.push(RosNode {
-            id: EntityId::new(format!("node:{}:{logical_name}", package.name)),
+            id: node_id,
             logical_name,
             package_id: package.id.clone(),
             executable: executable.to_owned(),
@@ -434,12 +438,24 @@ mod tests {
 
         let node = &nodes[0];
 
-        assert_eq!(node.id.as_str(), "node:camera:camera");
+        assert_eq!(
+            node.id.as_str(),
+            "node:camera:src/camera/src/camera.rs:node"
+        );
         assert_eq!(node.logical_name, "camera");
         assert_eq!(node.package_id, package.id);
         assert_eq!(node.executable, "camera");
         assert_eq!(node.runtime_state, RuntimeState::Unknown);
         assert_eq!(node.endpoints.len(), 1);
+
+        let renamed_source = source.replacen("\"camera\"", "\"renamed_camera\"", 1);
+        let renamed_nodes = scan_rust_source(
+            &package,
+            "camera",
+            &renamed_source,
+            "src/camera/src/camera.rs",
+        )?;
+        assert_eq!(renamed_nodes[0].id, node.id);
 
         let endpoint = &node.endpoints[0];
 

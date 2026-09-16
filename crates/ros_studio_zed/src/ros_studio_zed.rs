@@ -2,26 +2,30 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
+    time::Duration,
 };
 
+#[cfg(test)]
+use anyhow::Context as _;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
-    App, Bounds, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable,
+    App, Bounds, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, TaskExt, WeakEntity, Window,
-    actions, canvas, point,
+    Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, TaskExt,
+    WeakEntity, Window, actions, canvas, point,
 };
 use rope::Point as TextPoint;
 use ros_studio_model::{Confidence, EndpointKind, Project, RuntimeState, SourceLocation};
-use ui::{Button, Headline, HeadlineSize, Label, LabelSize, prelude::*};
+use ui::{Button, Headline, HeadlineSize, Label, LabelSize, Tooltip, prelude::*};
 use workspace::{
-    Workspace,
+    Pane, StatusItemView, Workspace,
     item::{Item, ItemEvent},
 };
 
+#[cfg(test)]
 const FIXTURE_GRAPH: &str = include_str!("../../../examples/drone_demo_ws/expected_graph.json");
-const FIXTURE_WORKSPACE_DIRECTORY: &str = "examples/drone_demo_ws";
+const RESCAN_DEBOUNCE: Duration = Duration::from_millis(200);
 const MINIMUM_ZOOM_PERCENT: u16 = 75;
 const MAXIMUM_ZOOM_PERCENT: u16 = 150;
 const ZOOM_STEP_PERCENT: u16 = 25;
@@ -35,6 +39,10 @@ const GRAPH_ROW_GAP: f32 = 120.0;
 const GRAPH_DOT_SPACING: f32 = 32.0;
 const NODE_CARD_WIDTH: f32 = 240.0;
 const NODE_CARD_HEIGHT: f32 = 176.0;
+const NEW_NODE_HORIZONTAL_GAP: f32 = 80.0;
+const NEW_NODE_VERTICAL_GAP: f32 = 64.0;
+const DEFAULT_VIEWPORT_CENTER_X: f32 = 600.0;
+const DEFAULT_VIEWPORT_CENTER_Y: f32 = 360.0;
 const EDGE_LABEL_WIDTH: f32 = 200.0;
 const EDGE_LABEL_OFFSET: f32 = 20.0;
 const LEFT_COLUMN_X: f32 = 48.0;
@@ -88,34 +96,113 @@ actions!(
     ros_studio,
     [
         /// Opens the ROS 2 Studio graph.
-        OpenGraph
+        OpenGraph,
+        /// Shows or closes the ROS 2 Studio graph.
+        ToggleGraph
     ]
 );
 
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _, _| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
-            let existing = workspace
-                .active_pane()
-                .read(cx)
-                .items()
-                .find_map(|item| item.downcast::<RosGraph>());
-
-            if let Some(existing) = existing {
-                workspace.activate_item(&existing, true, true, window, cx);
-            } else {
-                let workspace_handle = cx.weak_entity();
-                let graph = cx.new(|cx| RosGraph::new(workspace_handle, cx));
-                workspace.add_item_to_active_pane(Box::new(graph), None, true, window, cx);
-            }
+            open_graph(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &ToggleGraph, window, cx| {
+            toggle_graph(workspace, window, cx);
+        });
+
+        if let Some(window) = window {
+            let status_button = cx.new(|_| RosGraphStatusButton::new());
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                status_bar.add_left_item(status_button, window, cx);
+            });
+        }
     })
     .detach();
 }
 
+fn graph_item(workspace: &Workspace, cx: &App) -> Option<(Entity<Pane>, Entity<RosGraph>)> {
+    workspace.panes().iter().find_map(|pane| {
+        pane.read(cx)
+            .items()
+            .find_map(|item| item.downcast::<RosGraph>())
+            .map(|graph| (pane.clone(), graph))
+    })
+}
+
+fn open_graph(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some((_, graph)) = graph_item(workspace, cx) {
+        workspace.activate_item(&graph, true, true, window, cx);
+        return;
+    }
+
+    let workspace_handle = cx.weak_entity();
+    let workspace_root = workspace
+        .worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+    let project = workspace.project().clone();
+    let graph = cx.new(|cx| RosGraph::new(workspace_handle, workspace_root, project, cx));
+    workspace.add_item_to_active_pane(Box::new(graph), None, true, window, cx);
+}
+
+fn toggle_graph(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some((pane, graph)) = graph_item(workspace, cx) {
+        pane.update(cx, |pane, cx| {
+            pane.remove_item(graph.entity_id(), false, false, window, cx);
+        });
+    } else {
+        open_graph(workspace, window, cx);
+    }
+}
+
+struct RosGraphStatusButton {
+    graph_is_active: bool,
+}
+
+impl RosGraphStatusButton {
+    fn new() -> Self {
+        Self {
+            graph_is_active: false,
+        }
+    }
+}
+
+impl Render for RosGraphStatusButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("ros-graph-status-button", "ROS Graph")
+            .label_size(LabelSize::Small)
+            .toggle_state(self.graph_is_active)
+            .tooltip(Tooltip::text("Show or close ROS Graph"))
+            .on_click(cx.listener(|_, _, window, cx| {
+                window.dispatch_action(Box::new(ToggleGraph), cx);
+            }))
+    }
+}
+
+impl StatusItemView for RosGraphStatusButton {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_is_active = active_pane_item
+            .and_then(|item| item.downcast::<RosGraph>())
+            .is_some();
+        cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
 pub struct RosGraph {
     workspace: WeakEntity<Workspace>,
+    workspace_root: Option<PathBuf>,
     project: Result<Project, SharedString>,
+    is_scanning: bool,
     node_layouts: Vec<GraphNodeLayout>,
     selected_node_id: Option<String>,
     node_drag: Option<GraphNodeDrag>,
@@ -125,22 +212,25 @@ pub struct RosGraph {
     canvas_bounds: Option<Bounds<Pixels>>,
     zoom_percent: u16,
     focus_handle: FocusHandle,
+    _rescan_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl RosGraph {
-    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
-        let project = load_fixture_project().map_err(|error| {
-            SharedString::from(format!("Failed to load ROS graph fixture: {error}"))
-        });
-        let node_layouts = project
-            .as_ref()
-            .map(|project| graph_layout(project, &graph_edges(project)))
-            .unwrap_or_default();
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        workspace_root: Option<PathBuf>,
+        project: Entity<project::Project>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscriptions = vec![cx.subscribe(&project, Self::handle_project_event)];
 
-        Self {
+        let mut graph = Self {
             workspace,
-            project,
-            node_layouts,
+            workspace_root,
+            project: Err("Scanning ROS workspace…".into()),
+            is_scanning: true,
+            node_layouts: Vec::new(),
             selected_node_id: None,
             node_drag: None,
             canvas_pan: None,
@@ -149,7 +239,100 @@ impl RosGraph {
             canvas_bounds: None,
             zoom_percent: 100,
             focus_handle: cx.focus_handle(),
+            _rescan_task: Task::ready(()),
+            _subscriptions: subscriptions,
+        };
+        graph.schedule_rescan(Duration::ZERO, cx);
+        graph
+    }
+
+    fn handle_project_event(
+        &mut self,
+        _project: Entity<project::Project>,
+        event: &project::Event,
+        cx: &mut Context<Self>,
+    ) {
+        let project::Event::WorktreeUpdatedEntries(_, entries) = event else {
+            return;
+        };
+        let contains_ros_source_change = entries.iter().any(|(path, _, _)| {
+            matches!(
+                path.extension(),
+                Some("rs" | "py" | "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx")
+            ) || matches!(path.file_name(), Some("package.xml" | "Cargo.toml"))
+        });
+
+        if contains_ros_source_change {
+            self.schedule_rescan(RESCAN_DEBOUNCE, cx);
         }
+    }
+
+    fn schedule_rescan(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let Some(workspace_root) = self.workspace_root.clone() else {
+            self.project = Err("No local workspace is open.".into());
+            self.is_scanning = false;
+            cx.notify();
+            return;
+        };
+        let project_name = workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ros_workspace")
+            .to_owned();
+
+        self.is_scanning = true;
+        cx.notify();
+        self._rescan_task = cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let scan_result = cx
+                .background_spawn(async move {
+                    ros_studio_scan::scan_project(&workspace_root, &project_name)
+                })
+                .await;
+
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.apply_scan_result(scan_result);
+                cx.notify();
+            });
+        });
+    }
+
+    fn apply_scan_result(&mut self, scan_result: anyhow::Result<Project>) {
+        self.is_scanning = false;
+        match scan_result {
+            Ok(project) => {
+                let edges = graph_edges(&project);
+                let viewport_center = self.visible_graph_center();
+                self.node_layouts =
+                    merge_graph_layouts(&self.node_layouts, &project, &edges, viewport_center);
+                self.selected_node_id = self.selected_node_id.take().filter(|selected_node_id| {
+                    project
+                        .nodes
+                        .iter()
+                        .any(|node| node.id.as_str() == selected_node_id.as_str())
+                });
+                self.project = Ok(project);
+            }
+            Err(error) => {
+                self.project = Err(format!("Failed to scan ROS workspace: {error:#}").into());
+            }
+        }
+    }
+
+    fn visible_graph_center(&self) -> (f32, f32) {
+        let Some(canvas_bounds) = self.canvas_bounds else {
+            return (DEFAULT_VIEWPORT_CENTER_X, DEFAULT_VIEWPORT_CENTER_Y);
+        };
+        let zoom_scale = f32::from(self.zoom_percent) / 100.0;
+        (
+            (canvas_bounds.size.width.as_f32() / 2.0 - self.camera_offset_x) / zoom_scale,
+            (canvas_bounds.size.height.as_f32() / 2.0 - self.camera_offset_y) / zoom_scale,
+        )
     }
 
     fn apply_drag_position(&mut self, mouse_x: f32, mouse_y: f32, zoom_scale: f32) -> bool {
@@ -243,9 +426,15 @@ impl RosGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(source_path) = fixture_source_path(&source_location) else {
+        let Some(workspace_root) = self
+            .project
+            .as_ref()
+            .ok()
+            .map(|project| PathBuf::from(&project.root_path))
+        else {
             return;
         };
+        let source_path = workspace_root.join(&source_location.path);
         let workspace = self.workspace.clone();
         let point = TextPoint::new(source_location.line, source_location.column);
 
@@ -283,17 +472,171 @@ impl RosGraph {
     }
 }
 
-fn fixture_source_path(source_location: &SourceLocation) -> Option<PathBuf> {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
-    Some(
-        repository_root
-            .join(FIXTURE_WORKSPACE_DIRECTORY)
-            .join(&source_location.path),
-    )
-}
-
+#[cfg(test)]
 fn load_fixture_project() -> Result<Project, serde_json::Error> {
     serde_json::from_str(FIXTURE_GRAPH)
+}
+
+fn merge_graph_layouts(
+    existing_layouts: &[GraphNodeLayout],
+    project: &Project,
+    edges: &[GraphEdge],
+    viewport_center: (f32, f32),
+) -> Vec<GraphNodeLayout> {
+    let generated_layouts = graph_layout(project, edges);
+    if existing_layouts.is_empty() {
+        return center_layouts(generated_layouts, viewport_center);
+    }
+
+    let current_node_ids = project
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut layouts = existing_layouts
+        .iter()
+        .filter(|layout| current_node_ids.contains(layout.node_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let new_node_ids = generated_layouts
+        .iter()
+        .filter(|layout| {
+            !layouts
+                .iter()
+                .any(|existing_layout| existing_layout.node_id == layout.node_id)
+        })
+        .map(|layout| layout.node_id.clone())
+        .collect::<Vec<_>>();
+    let unconnected_node_ids = new_node_ids
+        .iter()
+        .filter(|node_id| connected_candidate(node_id, edges, &layouts).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let unconnected_count = unconnected_node_ids.len();
+    let mut unconnected_index = 0_usize;
+
+    for node_id in new_node_ids {
+        let preferred_position =
+            connected_candidate(&node_id, edges, &layouts).unwrap_or_else(|| {
+                let x = viewport_center.0 - NODE_CARD_WIDTH / 2.0
+                    + centered_slot_offset(unconnected_index, unconnected_count)
+                        * (NODE_CARD_WIDTH + NEW_NODE_HORIZONTAL_GAP);
+                unconnected_index += 1;
+                (x, viewport_center.1 - NODE_CARD_HEIGHT / 2.0)
+            });
+        let (x, y) = nearest_available_position(preferred_position, &layouts);
+        layouts.push(GraphNodeLayout { node_id, x, y });
+    }
+
+    layouts
+}
+
+fn center_layouts(
+    mut layouts: Vec<GraphNodeLayout>,
+    viewport_center: (f32, f32),
+) -> Vec<GraphNodeLayout> {
+    let Some(first_layout) = layouts.first() else {
+        return layouts;
+    };
+    let mut minimum_x = first_layout.x;
+    let mut minimum_y = first_layout.y;
+    let mut maximum_x = first_layout.x + NODE_CARD_WIDTH;
+    let mut maximum_y = first_layout.y + NODE_CARD_HEIGHT;
+
+    for layout in layouts.iter().skip(1) {
+        minimum_x = minimum_x.min(layout.x);
+        minimum_y = minimum_y.min(layout.y);
+        maximum_x = maximum_x.max(layout.x + NODE_CARD_WIDTH);
+        maximum_y = maximum_y.max(layout.y + NODE_CARD_HEIGHT);
+    }
+
+    let horizontal_offset = viewport_center.0 - (minimum_x + maximum_x) / 2.0;
+    let vertical_offset = viewport_center.1 - (minimum_y + maximum_y) / 2.0;
+    for layout in &mut layouts {
+        layout.x += horizontal_offset;
+        layout.y += vertical_offset;
+    }
+    layouts
+}
+
+fn connected_candidate(
+    node_id: &str,
+    edges: &[GraphEdge],
+    layouts: &[GraphNodeLayout],
+) -> Option<(f32, f32)> {
+    let mut candidates = Vec::new();
+
+    for edge in edges {
+        if edge.publisher_node_id == node_id {
+            if let Some(subscriber_layout) = layouts
+                .iter()
+                .find(|layout| layout.node_id == edge.subscriber_node_id)
+            {
+                candidates.push((
+                    subscriber_layout.x - NODE_CARD_WIDTH - NEW_NODE_HORIZONTAL_GAP,
+                    subscriber_layout.y,
+                ));
+            }
+        } else if edge.subscriber_node_id == node_id
+            && let Some(publisher_layout) = layouts
+                .iter()
+                .find(|layout| layout.node_id == edge.publisher_node_id)
+        {
+            candidates.push((
+                publisher_layout.x + NODE_CARD_WIDTH + NEW_NODE_HORIZONTAL_GAP,
+                publisher_layout.y,
+            ));
+        }
+    }
+
+    (!candidates.is_empty()).then(|| {
+        let candidate_count = candidates.len() as f32;
+        let (total_x, total_y) = candidates
+            .into_iter()
+            .fold((0.0, 0.0), |(total_x, total_y), (x, y)| {
+                (total_x + x, total_y + y)
+            });
+        (total_x / candidate_count, total_y / candidate_count)
+    })
+}
+
+fn centered_slot_offset(index: usize, count: usize) -> f32 {
+    index as f32 - count.saturating_sub(1) as f32 / 2.0
+}
+
+fn nearest_available_position(
+    preferred_position: (f32, f32),
+    layouts: &[GraphNodeLayout],
+) -> (f32, f32) {
+    let horizontal_step = NODE_CARD_WIDTH + NEW_NODE_HORIZONTAL_GAP;
+    let vertical_step = NODE_CARD_HEIGHT + NEW_NODE_VERTICAL_GAP;
+
+    for row in 0..8 {
+        let y = preferred_position.1 + row as f32 * vertical_step;
+        for column in 0..8 {
+            let offsets = if column == 0 {
+                [0.0, 0.0]
+            } else {
+                [column as f32, -(column as f32)]
+            };
+            for offset in offsets {
+                let candidate = (preferred_position.0 + offset * horizontal_step, y);
+                if layouts
+                    .iter()
+                    .all(|layout| !positions_overlap(candidate, layout))
+                {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    preferred_position
+}
+
+fn positions_overlap(position: (f32, f32), layout: &GraphNodeLayout) -> bool {
+    (position.0 - layout.x).abs() < NODE_CARD_WIDTH + NEW_NODE_HORIZONTAL_GAP / 2.0
+        && (position.1 - layout.y).abs() < NODE_CARD_HEIGHT + NEW_NODE_VERTICAL_GAP / 2.0
 }
 
 fn graph_edges(project: &Project) -> Vec<GraphEdge> {
@@ -737,6 +1080,12 @@ impl Item for RosGraph {
     fn to_item_events(event: &Self::Event, emit: &mut dyn FnMut(ItemEvent)) {
         emit(*event);
     }
+
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.node_drag = None;
+        self.canvas_pan = None;
+        cx.notify();
+    }
 }
 
 impl Render for RosGraph {
@@ -801,7 +1150,14 @@ impl Render for RosGraph {
                                                 Label::new("DESIGN")
                                                     .size(LabelSize::XSmall)
                                                     .color(Color::Accent),
-                                            ),
+                                            )
+                                            .when(self.is_scanning, |header| {
+                                                header.child(
+                                                    Label::new("SCANNING")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         Label::new(format!(
@@ -1200,6 +1556,28 @@ impl Render for RosGraph {
                                                             }
                                                         }),
                                                     )
+                                                    .on_mouse_up(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.apply_drag_position(
+                                                                event.position.x.as_f32(),
+                                                                event.position.y.as_f32(),
+                                                                zoom_scale,
+                                                            );
+                                                            this.node_drag = None;
+                                                            this.canvas_pan = None;
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .on_mouse_up_out(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                                            this.node_drag = None;
+                                                            this.canvas_pan = None;
+                                                            cx.notify();
+                                                        }),
+                                                    )
                                                     .child(
                                                         h_flex()
                                                             .justify_between()
@@ -1333,7 +1711,14 @@ impl Render for RosGraph {
             Err(error) => content
                 .justify_center()
                 .items_center()
-                .child(Headline::new("Unable to load ROS Graph").size(HeadlineSize::Small))
+                .child(
+                    Headline::new(if self.is_scanning {
+                        "Scanning ROS workspace"
+                    } else {
+                        "Unable to load ROS Graph"
+                    })
+                    .size(HeadlineSize::Small),
+                )
                 .child(
                     Label::new(error.clone())
                         .size(LabelSize::Small)
@@ -1366,20 +1751,25 @@ mod tests {
             graph_edges(&project),
             [
                 GraphEdge {
-                    publisher_node_id: "node:camera:camera".to_owned(),
-                    subscriber_node_id: "node:detector:detector".to_owned(),
+                    publisher_node_id: "node:camera:src/camera/src/camera.rs:node".to_owned(),
+                    subscriber_node_id: "node:detector:src/detector/src/detector.rs:node"
+                        .to_owned(),
                     topic: "/camera/image".to_owned(),
                     type_name: "sensor_msgs::msg::Image".to_owned(),
                 },
                 GraphEdge {
-                    publisher_node_id: "node:detector:detector".to_owned(),
-                    subscriber_node_id: "node:navigation:navigation".to_owned(),
+                    publisher_node_id: "node:detector:src/detector/src/detector.rs:node".to_owned(),
+                    subscriber_node_id: "node:navigation:src/navigation/src/navigation.rs:node"
+                        .to_owned(),
                     topic: "/detections".to_owned(),
                     type_name: "vision_msgs::msg::Detection2DArray".to_owned(),
                 },
                 GraphEdge {
-                    publisher_node_id: "node:navigation:navigation".to_owned(),
-                    subscriber_node_id: "node:autopilot_bridge:autopilot_bridge".to_owned(),
+                    publisher_node_id: "node:navigation:src/navigation/src/navigation.rs:node"
+                        .to_owned(),
+                    subscriber_node_id:
+                        "node:autopilot_bridge:src/autopilot_bridge/src/autopilot_bridge.rs:node"
+                            .to_owned(),
                     topic: "/cmd_vel".to_owned(),
                     type_name: "geometry_msgs::msg::Twist".to_owned(),
                 },
@@ -1399,28 +1789,96 @@ mod tests {
             layouts,
             [
                 GraphNodeLayout {
-                    node_id: "node:camera:camera".to_owned(),
+                    node_id: "node:camera:src/camera/src/camera.rs:node".to_owned(),
                     x: 48.0,
                     y: 64.0,
                 },
                 GraphNodeLayout {
-                    node_id: "node:detector:detector".to_owned(),
+                    node_id: "node:detector:src/detector/src/detector.rs:node".to_owned(),
                     x: 500.0,
                     y: 64.0,
                 },
                 GraphNodeLayout {
-                    node_id: "node:navigation:navigation".to_owned(),
+                    node_id: "node:navigation:src/navigation/src/navigation.rs:node".to_owned(),
                     x: 548.0,
                     y: 360.0,
                 },
                 GraphNodeLayout {
-                    node_id: "node:autopilot_bridge:autopilot_bridge".to_owned(),
+                    node_id:
+                        "node:autopilot_bridge:src/autopilot_bridge/src/autopilot_bridge.rs:node"
+                            .to_owned(),
                     x: 100.0,
                     y: 360.0,
                 },
             ]
         );
         assert_eq!(graph_height(project.nodes.len()), 720.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn places_connected_new_node_next_to_its_family() -> anyhow::Result<()> {
+        let project = load_fixture_project()?;
+        let camera_id = "node:camera:src/camera/src/camera.rs:node";
+        let detector_id = "node:detector:src/detector/src/detector.rs:node";
+        let mut previous_project = project.clone();
+        previous_project
+            .nodes
+            .retain(|node| node.id.as_str() != camera_id);
+        let mut previous_layouts = graph_layout(&previous_project, &graph_edges(&previous_project));
+        let Some(detector_layout) = previous_layouts
+            .iter_mut()
+            .find(|layout| layout.node_id == detector_id)
+        else {
+            anyhow::bail!("detector fixture layout should exist");
+        };
+        detector_layout.x = 600.0;
+        detector_layout.y = 1_000.0;
+
+        let layouts = merge_graph_layouts(
+            &previous_layouts,
+            &project,
+            &graph_edges(&project),
+            (600.0, 360.0),
+        );
+        let Some(camera_layout) = layouts.iter().find(|layout| layout.node_id == camera_id) else {
+            anyhow::bail!("camera fixture layout should exist");
+        };
+
+        assert_eq!(camera_layout.x, 280.0);
+        assert_eq!(camera_layout.y, 1_000.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn centers_initial_graph_in_visible_viewport() -> anyhow::Result<()> {
+        let project = load_fixture_project()?;
+        let layouts = merge_graph_layouts(&[], &project, &graph_edges(&project), (800.0, 500.0));
+        let minimum_x = layouts
+            .iter()
+            .map(|layout| layout.x)
+            .reduce(f32::min)
+            .context("fixture layouts should not be empty")?;
+        let maximum_x = layouts
+            .iter()
+            .map(|layout| layout.x + NODE_CARD_WIDTH)
+            .reduce(f32::max)
+            .context("fixture layouts should not be empty")?;
+        let minimum_y = layouts
+            .iter()
+            .map(|layout| layout.y)
+            .reduce(f32::min)
+            .context("fixture layouts should not be empty")?;
+        let maximum_y = layouts
+            .iter()
+            .map(|layout| layout.y + NODE_CARD_HEIGHT)
+            .reduce(f32::max)
+            .context("fixture layouts should not be empty")?;
+
+        assert_eq!((minimum_x + maximum_x) / 2.0, 800.0);
+        assert_eq!((minimum_y + maximum_y) / 2.0, 500.0);
 
         Ok(())
     }
