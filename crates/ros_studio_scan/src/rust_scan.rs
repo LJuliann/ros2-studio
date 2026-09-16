@@ -33,10 +33,8 @@ pub fn detect_rust_endpoints(
     let mut detected = Vec::new();
 
     for call in calls {
-        let kind = match call_name(call, source) {
-            Some("create_publisher") => EndpointKind::Publisher,
-            Some("create_subscription") => EndpointKind::Subscription,
-            _ => continue,
+        let Some(kind) = endpoint_kind(call, source) else {
+            continue;
         };
 
         let Some(node_variable_name) = call_receiver(call, source) else {
@@ -51,7 +49,7 @@ pub fn detect_rust_endpoints(
             continue;
         };
 
-        let Some(type_name) = first_type_argument(call, source) else {
+        let Some(type_name) = endpoint_type_name(call, kind, source) else {
             continue;
         };
 
@@ -59,7 +57,7 @@ pub fn detect_rust_endpoints(
             node_variable_name: node_variable_name.to_owned(),
             kind,
             topic_name,
-            type_name: type_name.to_owned(),
+            type_name,
             source_location: source_location(source_path, topic_node)?,
         });
     }
@@ -181,7 +179,13 @@ pub fn detect_rust_nodes(source: &str, source_path: &str) -> anyhow::Result<Vec<
             continue;
         }
 
-        let Some(name_node) = named_argument(call, 1) else {
+        let name_argument_index = if call_receiver(call, source).is_some() {
+            0
+        } else {
+            1
+        };
+
+        let Some(name_node) = named_argument(call, name_argument_index) else {
             continue;
         };
 
@@ -203,6 +207,30 @@ pub fn detect_rust_nodes(source: &str, source_path: &str) -> anyhow::Result<Vec<
     detected.sort_by(|left, right| left.source_location.cmp(&right.source_location));
 
     Ok(detected)
+}
+
+fn endpoint_kind(call: Node<'_>, source: &str) -> Option<EndpointKind> {
+    match call_name(call, source)? {
+        "create_publisher" => Some(EndpointKind::Publisher),
+        "create_subscription" => Some(EndpointKind::Subscription),
+        "create_client" => Some(EndpointKind::ServiceClient),
+        "create_service" => Some(EndpointKind::ServiceServer),
+        "create_action_client" => Some(EndpointKind::ActionClient),
+        "create_action_server" => Some(EndpointKind::ActionServer),
+        _ => None,
+    }
+}
+
+fn endpoint_type_name(call: Node<'_>, kind: EndpointKind, source: &str) -> Option<String> {
+    if let Some(type_name) = first_type_argument(call, source) {
+        return Some(type_name.to_owned());
+    }
+
+    if kind == EndpointKind::Subscription {
+        return first_closure_parameter_type(call, source).map(str::to_owned);
+    }
+
+    None
 }
 
 fn collect_nodes_of_kind<'tree>(node: Node<'tree>, kind: &str, collected: &mut Vec<Node<'tree>>) {
@@ -250,6 +278,31 @@ fn first_type_argument<'source>(call: Node<'_>, source: &'source str) -> Option<
     let type_arguments = function.child_by_field_name("type_arguments")?;
 
     node_text(type_arguments.named_child(0)?, source)
+}
+
+fn first_closure_parameter_type<'source>(
+    call: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut argument_cursor = arguments.walk();
+
+    for argument in arguments.named_children(&mut argument_cursor) {
+        if argument.kind() != "closure_expression" {
+            continue;
+        }
+
+        let parameters = argument.child_by_field_name("parameters")?;
+        let mut parameter_cursor = parameters.walk();
+
+        for parameter in parameters.named_children(&mut parameter_cursor) {
+            if parameter.kind() == "parameter" {
+                return node_text(parameter.child_by_field_name("type")?, source);
+            }
+        }
+    }
+
+    None
 }
 
 fn callable_expression(call: Node<'_>) -> Option<Node<'_>> {
@@ -356,6 +409,27 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn detects_executor_node_creation() -> anyhow::Result<()> {
+        let source = r#"fn main() -> anyhow::Result<()> {
+    let mut executor = context.create_basic_executor();
+    let node = executor.create_node("drone_flight")?;
+    Ok(())
+}
+"#;
+
+        let detected = detect_rust_nodes(source, "src/main.rs")?;
+
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].variable_name, "node");
+        assert_eq!(detected[0].logical_name, "drone_flight");
+        assert_eq!(detected[0].source_location.path, "src/main.rs");
+        assert_eq!(detected[0].source_location.line, 2);
+
+        Ok(())
+    }
+
     #[test]
     fn detects_publishers_and_subscriptions() -> anyhow::Result<()> {
         let source = r#"fn configure(node: &mut rclrs::Node) -> anyhow::Result<()> {
@@ -399,6 +473,56 @@ mod tests {
                         column: 12,
                     },
                 },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn detects_current_rclrs_interfaces() -> anyhow::Result<()> {
+        let source = r#"fn configure(node: &mut rclrs::Node) -> anyhow::Result<()> {
+    let publisher = node.create_publisher::<FlightStatus>("flight/status")?;
+    let subscription = node.create_subscription(
+        "water_gun/aim_angles",
+        move |aim_solution: AimSolution| {},
+    )?;
+    let service = node.create_service::<SetArmed, _>("flight/set_armed", move |request| {})?;
+    let action = node.create_action_server::<NavigateTo, _>(
+        "flight/navigate_to",
+        move |handle| {},
+    )?;
+    Ok(())
+}
+"#;
+
+        let detected = detect_rust_endpoints(source, "src/main.rs")?;
+        let summaries = detected
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.kind,
+                    endpoint.topic_name.as_str(),
+                    endpoint.type_name.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            summaries,
+            [
+                (EndpointKind::Publisher, "flight/status", "FlightStatus"),
+                (
+                    EndpointKind::Subscription,
+                    "water_gun/aim_angles",
+                    "AimSolution",
+                ),
+                (EndpointKind::ServiceServer, "flight/set_armed", "SetArmed",),
+                (
+                    EndpointKind::ActionServer,
+                    "flight/navigate_to",
+                    "NavigateTo",
+                ),
             ]
         );
 
