@@ -17,5 +17,8 @@ name = "ros-studio-daemon"
 path = "src/main.rs"
 
 [dependencies]
-ros_studio_model.workspace = true
 ros_studio_protocol.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
