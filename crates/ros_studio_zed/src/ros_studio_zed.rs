@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use gpui::{
-    App, Bounds, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Window, actions, canvas, point,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
 };
-use ros_studio_model::{EndpointKind, Project};
+
+use editor::{Editor, SelectionEffects, scroll::Autoscroll};
+use gpui::{
+    App, Bounds, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
+    Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, TaskExt, WeakEntity, Window,
+    actions, canvas, point,
+};
+use rope::Point as TextPoint;
+use ros_studio_model::{Confidence, EndpointKind, Project, RuntimeState, SourceLocation};
 use ui::{Button, Headline, HeadlineSize, Label, LabelSize, prelude::*};
 use workspace::{
     Workspace,
@@ -15,6 +21,7 @@ use workspace::{
 };
 
 const FIXTURE_GRAPH: &str = include_str!("../../../examples/drone_demo_ws/expected_graph.json");
+const FIXTURE_WORKSPACE_DIRECTORY: &str = "examples/drone_demo_ws";
 const MINIMUM_ZOOM_PERCENT: u16 = 75;
 const MAXIMUM_ZOOM_PERCENT: u16 = 150;
 const ZOOM_STEP_PERCENT: u16 = 25;
@@ -97,7 +104,8 @@ pub fn init(cx: &mut App) {
             if let Some(existing) = existing {
                 workspace.activate_item(&existing, true, true, window, cx);
             } else {
-                let graph = cx.new(RosGraph::new);
+                let workspace_handle = cx.weak_entity();
+                let graph = cx.new(|cx| RosGraph::new(workspace_handle, cx));
                 workspace.add_item_to_active_pane(Box::new(graph), None, true, window, cx);
             }
         });
@@ -106,6 +114,7 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct RosGraph {
+    workspace: WeakEntity<Workspace>,
     project: Result<Project, SharedString>,
     node_layouts: Vec<GraphNodeLayout>,
     selected_node_id: Option<String>,
@@ -119,7 +128,7 @@ pub struct RosGraph {
 }
 
 impl RosGraph {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let project = load_fixture_project().map_err(|error| {
             SharedString::from(format!("Failed to load ROS graph fixture: {error}"))
         });
@@ -129,6 +138,7 @@ impl RosGraph {
             .unwrap_or_default();
 
         Self {
+            workspace,
             project,
             node_layouts,
             selected_node_id: None,
@@ -226,6 +236,60 @@ impl RosGraph {
         }
         cx.stop_propagation();
     }
+
+    fn open_source_location(
+        &self,
+        source_location: SourceLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source_path) = fixture_source_path(&source_location) else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let point = TextPoint::new(source_location.line, source_location.column);
+
+        window
+            .spawn(cx, async move |cx| {
+                let item = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_abs_path(
+                            source_path,
+                            workspace::OpenOptions {
+                                focus: Some(true),
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await?;
+                let Some(editor) = item.downcast::<Editor>() else {
+                    return anyhow::Ok(());
+                };
+
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([point..point]),
+                    );
+                })?;
+
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+    }
+}
+
+fn fixture_source_path(source_location: &SourceLocation) -> Option<PathBuf> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    Some(
+        repository_root
+            .join(FIXTURE_WORKSPACE_DIRECTORY)
+            .join(&source_location.path),
+    )
 }
 
 fn load_fixture_project() -> Result<Project, serde_json::Error> {
@@ -431,6 +495,222 @@ fn edge_geometry(edge: &GraphEdge, node_layouts: &[GraphNodeLayout]) -> Option<G
     })
 }
 
+fn endpoint_kind_label(kind: EndpointKind) -> &'static str {
+    match kind {
+        EndpointKind::Publisher => "Publisher",
+        EndpointKind::Subscription => "Subscription",
+        EndpointKind::ServiceClient => "Service client",
+        EndpointKind::ServiceServer => "Service server",
+        EndpointKind::ActionClient => "Action client",
+        EndpointKind::ActionServer => "Action server",
+    }
+}
+
+fn confidence_label(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::ConfirmedSource => "Confirmed by source",
+        Confidence::Inferred => "Inferred",
+        Confidence::RuntimeConfirmed => "Runtime confirmed",
+        Confidence::Conflict => "Conflict",
+        Confidence::Unknown => "Unknown",
+    }
+}
+
+fn runtime_state_label(runtime_state: RuntimeState) -> &'static str {
+    match runtime_state {
+        RuntimeState::Unknown => "Design only",
+        RuntimeState::Online => "Online",
+        RuntimeState::Offline => "Offline",
+        RuntimeState::RuntimeOnly => "Runtime only",
+        RuntimeState::Conflict => "Conflict",
+    }
+}
+
+fn source_location_label(source_location: &SourceLocation) -> String {
+    format!(
+        "{}:{}:{}",
+        source_location.path,
+        source_location.line.saturating_add(1),
+        source_location.column.saturating_add(1),
+    )
+}
+
+fn render_ros_inspector(
+    project: &Project,
+    selected_node_id: Option<&str>,
+    cx: &mut Context<RosGraph>,
+) -> Div {
+    let panel = v_flex()
+        .h_full()
+        .w(px(320.0))
+        .flex_none()
+        .p_3()
+        .gap_3()
+        .overflow_hidden()
+        .border_1()
+        .border_color(cx.theme().colors().border_variant)
+        .rounded_md()
+        .bg(cx.theme().colors().surface_background)
+        .child(
+            h_flex()
+                .justify_between()
+                .child(Headline::new("Inspector").size(HeadlineSize::Small))
+                .child(
+                    Label::new("DESIGN")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                ),
+        );
+
+    let Some(node) = selected_node_id.and_then(|node_id| {
+        project
+            .nodes
+            .iter()
+            .find(|node| node.id.as_str() == node_id)
+    }) else {
+        return panel
+            .child(
+                Label::new("No node selected")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(format!(
+                    "{} packages · {} nodes",
+                    project.packages.len(),
+                    project.nodes.len()
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new("Select a node to inspect its interfaces and source locations.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+    };
+
+    let package_name = project
+        .packages
+        .iter()
+        .find(|package| package.id == node.package_id)
+        .map(|package| package.name.as_str())
+        .unwrap_or(node.package_id.as_str());
+    let mut panel = panel
+        .child(
+            v_flex()
+                .gap_1()
+                .child(Headline::new(node.logical_name.clone()).size(HeadlineSize::Small))
+                .child(
+                    Label::new(format!("{package_name} · {}", node.executable))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(runtime_state_label(node.runtime_state))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                ),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .pt_3()
+                .child(
+                    Label::new("SOURCE")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+
+    if let Some(source_location) = node.source_locations.first().cloned() {
+        let source_label = source_location_label(&source_location);
+        panel = panel.child(
+            Button::new("ros-inspector-node-source", source_label)
+                .full_width()
+                .label_size(LabelSize::XSmall)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_source_location(source_location.clone(), window, cx);
+                })),
+        );
+    } else {
+        panel = panel.child(
+            Label::new("No source location")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+    }
+
+    panel = panel.child(
+        h_flex()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .pt_3()
+            .child(
+                Label::new("INTERFACES")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(node.endpoints.len().to_string())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ),
+    );
+
+    for (index, endpoint) in node.endpoints.iter().enumerate() {
+        let source_location = endpoint.source_location.clone();
+        let mut endpoint_card = v_flex()
+            .id(("ros-inspector-endpoint", index))
+            .gap_1()
+            .p_2()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_sm()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new(endpoint.name.clone()).size(LabelSize::Small))
+                    .child(
+                        Label::new(endpoint_kind_label(endpoint.kind))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    ),
+            )
+            .child(
+                Label::new(endpoint.type_name.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate_middle(),
+            )
+            .child(
+                Label::new(confidence_label(endpoint.confidence))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+
+        if let Some(source_location) = source_location {
+            let source_label = source_location_label(&source_location);
+            endpoint_card = endpoint_card.child(
+                Button::new(("ros-inspector-endpoint-source", index), source_label)
+                    .full_width()
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_source_location(source_location.clone(), window, cx);
+                    })),
+            );
+        }
+
+        panel = panel.child(endpoint_card);
+    }
+
+    panel
+}
+
 impl EventEmitter<ItemEvent> for RosGraph {}
 
 impl Focusable for RosGraph {
@@ -577,17 +857,22 @@ impl Render for RosGraph {
                             ),
                     )
                     .child(
-                        div()
-                            .id("ros-graph-viewport")
-                            .relative()
+                        h_flex()
                             .flex_1()
                             .min_h(px(420.0))
-                            .overflow_hidden()
-                            .border_color(cx.theme().colors().border_variant)
-                            .border_1()
-                            .rounded_md()
+                            .gap_3()
+                            .items_stretch()
                             .child(
                                 div()
+                                    .id("ros-graph-viewport")
+                                    .relative()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .border_1()
+                                    .rounded_md()
+                                    .child(
+                                        div()
                                     .id("ros-graph-canvas")
                                     .relative()
                                     .size_full()
@@ -801,6 +1086,8 @@ impl Render for RosGraph {
                                                 node.id.as_str() == layout.node_id
                                             })?;
                                             let node_id = node.id.as_str().to_owned();
+                                            let primary_source_location =
+                                                node.source_locations.first().cloned();
                                             let selected =
                                                 selected_node_id.as_deref() == Some(&node_id);
                                             let package_name = project
@@ -860,10 +1147,23 @@ impl Render for RosGraph {
                                                         .bg(cx.theme().colors().element_selected)
                                                     })
                                                     .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
+                                                        move |this,
+                                                              event: &ClickEvent,
+                                                              window,
+                                                              cx| {
                                                             cx.stop_propagation();
                                                             this.selected_node_id =
                                                                 Some(node_id.clone());
+                                                            if event.click_count() >= 2
+                                                                && let Some(source_location) =
+                                                                    primary_source_location.clone()
+                                                            {
+                                                                this.open_source_location(
+                                                                    source_location,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            }
                                                             cx.notify();
                                                         },
                                                     ))
@@ -1021,7 +1321,13 @@ impl Render for RosGraph {
                                             )
                                         },
                                     )),
-                            ),
+                                    ),
+                            )
+                            .child(render_ros_inspector(
+                                project,
+                                selected_node_id.as_deref(),
+                                cx,
+                            )),
                     )
             }
             Err(error) => content

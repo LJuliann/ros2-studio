@@ -15494,7 +15494,10 @@ dependencies = [
 name = "ros_studio_zed"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "editor",
  "gpui",
+ "rope",
  "ros_studio_model",
  "ros_studio_protocol",
  "ros_studio_scan",
