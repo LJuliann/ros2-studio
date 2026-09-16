@@ -10,8 +10,17 @@ use quick_xml::{Reader, events::Event};
 use ros_studio_model::{EntityId, Package, Project};
 use walkdir::{DirEntry, WalkDir};
 
+mod cpp_scan;
+mod python_scan;
 mod rust_scan;
 
+pub use cpp_scan::{
+    DetectedCppEndpoint, DetectedCppNode, detect_cpp_endpoints, detect_cpp_nodes, scan_cpp_source,
+};
+pub use python_scan::{
+    DetectedPythonEndpoint, DetectedPythonNode, detect_python_endpoints, detect_python_nodes,
+    scan_python_source,
+};
 pub use rust_scan::{
     DetectedRustEndpoint, DetectedRustNode, detect_rust_endpoints, detect_rust_nodes,
     scan_rust_source,
@@ -24,6 +33,8 @@ pub struct DetectedPackage {
     pub manifest_path: PathBuf,
     pub cargo_manifest_path: Option<PathBuf>,
     pub rust_source_paths: Vec<PathBuf>,
+    pub python_source_paths: Vec<PathBuf>,
+    pub cpp_source_paths: Vec<PathBuf>,
 }
 
 pub fn find_package_manifests(root: &Path) -> Result<Vec<PathBuf>, walkdir::Error> {
@@ -43,6 +54,24 @@ pub fn find_package_manifests(root: &Path) -> Result<Vec<PathBuf>, walkdir::Erro
 }
 
 pub fn find_rust_sources(package_root: &Path) -> Result<Vec<PathBuf>, walkdir::Error> {
+    find_sources_with_extensions(package_root, &["rs"])
+}
+
+pub fn find_python_sources(package_root: &Path) -> Result<Vec<PathBuf>, walkdir::Error> {
+    find_sources_with_extensions(package_root, &["py"])
+}
+
+pub fn find_cpp_sources(package_root: &Path) -> Result<Vec<PathBuf>, walkdir::Error> {
+    find_sources_with_extensions(
+        package_root,
+        &["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx"],
+    )
+}
+
+fn find_sources_with_extensions(
+    package_root: &Path,
+    extensions: &[&str],
+) -> Result<Vec<PathBuf>, walkdir::Error> {
     let mut sources = Vec::new();
 
     for entry in WalkDir::new(package_root)
@@ -51,14 +80,14 @@ pub fn find_rust_sources(package_root: &Path) -> Result<Vec<PathBuf>, walkdir::E
     {
         let entry = entry?;
 
-        let is_rust_source = entry.file_type().is_file()
+        let is_supported_source = entry.file_type().is_file()
             && entry
                 .path()
                 .extension()
                 .and_then(|extension| extension.to_str())
-                == Some("rs");
+                .is_some_and(|extension| extensions.contains(&extension));
 
-        if is_rust_source {
+        if is_supported_source {
             sources.push(entry.into_path());
         }
     }
@@ -107,6 +136,8 @@ pub fn scan_workspace(root: &Path) -> anyhow::Result<Vec<DetectedPackage>> {
             .then_some(cargo_manifest_candidate);
 
         let rust_source_paths = find_rust_sources(package_directory)?;
+        let python_source_paths = find_python_sources(package_directory)?;
+        let cpp_source_paths = find_cpp_sources(package_directory)?;
 
         packages.push(DetectedPackage {
             package: Package {
@@ -117,6 +148,8 @@ pub fn scan_workspace(root: &Path) -> anyhow::Result<Vec<DetectedPackage>> {
             manifest_path,
             cargo_manifest_path,
             rust_source_paths,
+            python_source_paths,
+            cpp_source_paths,
         });
     }
 
@@ -149,6 +182,47 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
             let relative_source_path = normalized_path(relative_source_path)?;
 
             nodes.extend(scan_rust_source(
+                &package,
+                &executable,
+                &source,
+                &relative_source_path,
+            )?);
+        }
+
+        for source_path in detected_package.python_source_paths {
+            let source = fs::read_to_string(&source_path).with_context(|| {
+                format!("failed to read Python source {}", source_path.display())
+            })?;
+            let relative_source_path =
+                normalized_path(source_path.strip_prefix(root).with_context(|| {
+                    format!(
+                        "{} is outside workspace {}",
+                        source_path.display(),
+                        root.display()
+                    )
+                })?)?;
+
+            nodes.extend(scan_python_source(
+                &package,
+                &executable,
+                &source,
+                &relative_source_path,
+            )?);
+        }
+
+        for source_path in detected_package.cpp_source_paths {
+            let source = fs::read_to_string(&source_path)
+                .with_context(|| format!("failed to read C++ source {}", source_path.display()))?;
+            let relative_source_path =
+                normalized_path(source_path.strip_prefix(root).with_context(|| {
+                    format!(
+                        "{} is outside workspace {}",
+                        source_path.display(),
+                        root.display()
+                    )
+                })?)?;
+
+            nodes.extend(scan_cpp_source(
                 &package,
                 &executable,
                 &source,
@@ -283,6 +357,8 @@ mod tests {
                 detected.rust_source_paths,
                 vec![package_root.join("src").join(source_name)]
             );
+            assert!(detected.python_source_paths.is_empty());
+            assert!(detected.cpp_source_paths.is_empty());
         }
 
         Ok(())

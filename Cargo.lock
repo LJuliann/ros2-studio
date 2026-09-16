@@ -15486,6 +15486,8 @@ dependencies = [
  "ros_studio_model",
  "serde_json",
  "tree-sitter",
+ "tree-sitter-cpp",
+ "tree-sitter-python",
  "tree-sitter-rust",
  "walkdir",
 ]
@@ -15497,6 +15499,7 @@ dependencies = [
  "anyhow",
  "editor",
  "gpui",
+ "project",
  "rope",
  "ros_studio_model",
  "ros_studio_protocol",

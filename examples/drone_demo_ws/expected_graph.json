@@ -26,7 +26,7 @@
   ],
   "nodes": [
     {
-      "id": "node:autopilot_bridge:autopilot_bridge",
+      "id": "node:autopilot_bridge:src/autopilot_bridge/src/autopilot_bridge.rs:node",
       "logical_name": "autopilot_bridge",
       "package_id": "package:autopilot_bridge",
       "executable": "autopilot_bridge",
@@ -76,7 +76,7 @@
       "runtime_state": "unknown"
     },
     {
-      "id": "node:camera:camera",
+      "id": "node:camera:src/camera/src/camera.rs:node",
       "logical_name": "camera",
       "package_id": "package:camera",
       "executable": "camera",
@@ -126,7 +126,7 @@
       "runtime_state": "unknown"
     },
     {
-      "id": "node:detector:detector",
+      "id": "node:detector:src/detector/src/detector.rs:node",
       "logical_name": "detector",
       "package_id": "package:detector",
       "executable": "detector",
@@ -199,7 +199,7 @@
       "runtime_state": "unknown"
     },
     {
-      "id": "node:navigation:navigation",
+      "id": "node:navigation:src/navigation/src/navigation.rs:node",
       "logical_name": "navigation",
       "package_id": "package:navigation",
       "executable": "navigation",
