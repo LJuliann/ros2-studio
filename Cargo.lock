@@ -15458,8 +15458,9 @@ dependencies = [
 name = "ros_studio_daemon"
 version = "0.1.0"
 dependencies = [
- "ros_studio_model",
+ "anyhow",
  "ros_studio_protocol",
+ "serde_json",
 ]
 
 [[package]]
@@ -15474,7 +15475,10 @@ dependencies = [
 name = "ros_studio_protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ros_studio_model",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
