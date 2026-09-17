@@ -179,6 +179,7 @@ members = [
     "crates/repl",
     "crates/reqwest_client",
     "crates/rope",
+    "crates/ros_studio_codegen",
     "crates/ros_studio_daemon",
     "crates/ros_studio_model",
     "crates/ros_studio_protocol",
@@ -452,6 +453,7 @@ repl = { path = "crates/repl" }
 reqwest_client = { path = "crates/reqwest_client" }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", features = ["wav", "playback", "wav_output", "recording"] }
 rope = { path = "crates/rope" }
+ros_studio_codegen = { path = "crates/ros_studio_codegen" }
 ros_studio_daemon = { path = "crates/ros_studio_daemon" }
 ros_studio_model = { path = "crates/ros_studio_model" }
 ros_studio_protocol = { path = "crates/ros_studio_protocol" }

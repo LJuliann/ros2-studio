@@ -166,8 +166,10 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
     for detected_package in detected_packages {
         let package = detected_package.package;
         let executable = package.name.clone();
+        let package_root = root.join(&package.path);
 
         for source_path in detected_package.rust_source_paths {
+            let rust_executable = rust_executable_name(&source_path, &package_root, &executable);
             let source = fs::read_to_string(&source_path)
                 .with_context(|| format!("failed to read Rust source {}", source_path.display()))?;
 
@@ -183,7 +185,7 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
 
             nodes.extend(scan_rust_source(
                 &package,
-                &executable,
+                &rust_executable,
                 &source,
                 &relative_source_path,
             )?);
@@ -244,6 +246,17 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
     project.sort_deterministically();
 
     Ok(project)
+}
+
+fn rust_executable_name(source_path: &Path, package_root: &Path, package_name: &str) -> String {
+    source_path
+        .strip_prefix(package_root.join("src/bin"))
+        .ok()
+        .filter(|relative_path| relative_path.components().count() == 1)
+        .and_then(|relative_path| relative_path.file_stem())
+        .and_then(|file_stem| file_stem.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| package_name.to_owned())
 }
 
 fn normalized_path(path: &Path) -> anyhow::Result<String> {
@@ -372,6 +385,23 @@ mod tests {
         assert_eq!(sources, vec![package_root.join("src/camera.rs")]);
 
         Ok(())
+    }
+
+    #[test]
+    fn uses_binary_name_for_generated_rust_nodes() {
+        let package_root = Path::new("/workspace/src/camera");
+        assert_eq!(
+            rust_executable_name(
+                &package_root.join("src/bin/camera_backup.rs"),
+                package_root,
+                "camera"
+            ),
+            "camera_backup"
+        );
+        assert_eq!(
+            rust_executable_name(&package_root.join("src/camera.rs"), package_root, "camera"),
+            "camera"
+        );
     }
 
     #[test]

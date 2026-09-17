@@ -12,8 +12,8 @@ use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     App, Bounds, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, TaskExt,
-    WeakEntity, Window, actions, canvas, point,
+    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
+    TaskExt, WeakEntity, Window, actions, anchored, canvas, deferred, point,
 };
 use rope::Point as TextPoint;
 use ros_studio_model::{
@@ -21,12 +21,13 @@ use ros_studio_model::{
     design_live::{canonical_ros_type_name, reconcile_project},
 };
 use ros_studio_protocol::GraphPatch;
-use ui::{Button, Headline, HeadlineSize, Label, LabelSize, Tooltip, prelude::*};
+use ui::{Button, ContextMenu, Headline, HeadlineSize, Label, LabelSize, Tooltip, prelude::*};
 use workspace::{
     Pane, StatusItemView, Workspace,
     item::{Item, ItemEvent},
 };
 
+mod node_wizard;
 mod runtime_client;
 
 use runtime_client::RuntimeMessage;
@@ -200,7 +201,9 @@ actions!(
         /// Opens the ROS 2 Studio graph.
         OpenGraph,
         /// Shows or closes the ROS 2 Studio graph.
-        ToggleGraph
+        ToggleGraph,
+        /// Creates a Rust ROS node in the open workspace.
+        CreateNode
     ]
 );
 
@@ -211,6 +214,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ToggleGraph, window, cx| {
             toggle_graph(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &CreateNode, window, cx| {
+            open_node_wizard(workspace, window, cx);
         });
 
         if let Some(window) = window {
@@ -256,6 +262,29 @@ fn toggle_graph(workspace: &mut Workspace, window: &mut Window, cx: &mut Context
     } else {
         open_graph(workspace, window, cx);
     }
+}
+
+fn open_node_wizard(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let workspace_root = workspace
+        .worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+    let Some(workspace_root) = workspace_root else {
+        open_graph(workspace, window, cx);
+        return;
+    };
+    let initial_project = graph_item(workspace, cx)
+        .and_then(|(_, graph)| graph.read(cx).project.as_ref().ok().cloned());
+    let workspace_handle = cx.weak_entity();
+    workspace.toggle_modal(window, cx, move |window, cx| {
+        node_wizard::NodeWizard::new(
+            workspace_handle,
+            workspace_root,
+            initial_project,
+            window,
+            cx,
+        )
+    });
 }
 
 struct RosGraphStatusButton {
@@ -314,6 +343,7 @@ pub struct RosGraph {
     selected_node_id: Option<String>,
     node_drag: Option<GraphNodeDrag>,
     canvas_pan: Option<GraphCanvasPan>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     camera_offset_x: f32,
     camera_offset_y: f32,
     canvas_bounds: Option<Bounds<Pixels>>,
@@ -347,6 +377,7 @@ impl RosGraph {
             selected_node_id: None,
             node_drag: None,
             canvas_pan: None,
+            context_menu: None,
             camera_offset_x: 0.0,
             camera_offset_y: 0.0,
             canvas_bounds: None,
@@ -523,6 +554,25 @@ impl RosGraph {
                 self.runtime_diagnostic = Some(message);
             }
         }
+    }
+
+    fn show_canvas_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(self.focus_handle.clone())
+                .action("New ROS Node", Box::new(CreateNode))
+        });
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.context_menu = None;
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     fn visible_graph_center(&self) -> (f32, f32) {
@@ -1330,6 +1380,7 @@ impl Item for RosGraph {
     fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.node_drag = None;
         self.canvas_pan = None;
+        self.context_menu = None;
         cx.notify();
     }
 }
@@ -1342,7 +1393,16 @@ impl Render for RosGraph {
             .id("ros-graph-content")
             .p_4()
             .gap_3()
-            .bg(cx.theme().colors().editor_background);
+            .bg(cx.theme().colors().editor_background)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }));
 
         match &self.displayed_project {
             Ok(project) => {
@@ -1447,6 +1507,12 @@ impl Render for RosGraph {
                                 h_flex()
                                     .gap_3()
                                     .child(
+                                        Button::new("ros-graph-create-node", "Create node")
+                                            .on_click(cx.listener(|_, _, window, cx| {
+                                                window.dispatch_action(Box::new(CreateNode), cx);
+                                            })),
+                                    )
+                                    .child(
                                         h_flex()
                                             .gap_1()
                                             .child(
@@ -1538,8 +1604,16 @@ impl Render for RosGraph {
                                     })
                                     .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
                                     .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.show_canvas_context_menu(event.position, window, cx);
+                                        }),
+                                    )
+                                    .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.context_menu = None;
                                             this.canvas_pan = Some(GraphCanvasPan {
                                                 mouse_start_x: event.position.x.as_f32(),
                                                 mouse_start_y: event.position.y.as_f32(),
@@ -1822,6 +1896,12 @@ impl Render for RosGraph {
                                                             cx.notify();
                                                         },
                                                     ))
+                                                    .on_mouse_down(
+                                                        MouseButton::Right,
+                                                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         cx.listener({
