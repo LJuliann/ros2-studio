@@ -8,6 +8,14 @@ use ros_studio_protocol::{
 };
 use serde_json::Value;
 
+pub mod runtime_graph;
+
+#[cfg(feature = "ros-runtime")]
+mod runtime;
+
+#[cfg(feature = "ros-runtime")]
+pub use runtime::serve_ros_stdio;
+
 pub fn serve(reader: impl BufRead, mut writer: impl Write) -> io::Result<()> {
     for line in reader.lines() {
         let line = line?;
@@ -55,7 +63,7 @@ fn handle_request(message: RequestMessage) -> ResponseMessage {
     }
 }
 
-fn malformed_request(line: &str, error: &serde_json::Error) -> ResponseMessage {
+pub(crate) fn malformed_request(line: &str, error: &serde_json::Error) -> ResponseMessage {
     let value: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(_) => return ResponseMessage::error(None, PARSE_ERROR, error.to_string()),

@@ -686,6 +686,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
+name = "ament_rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b901da946b7b1620d44563e10c7634681af855a7f5fb59bd09b6eb801dcf6e49"
+dependencies = [
+ "itertools 0.8.2",
+ "walkdir",
+]
+
+[[package]]
 name = "ammonia"
 version = "4.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9044,6 +9054,15 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "itertools"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56a2d0bc861f9165be4eb3442afd3c236d8a98afd426f65d92324ae1091a484"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
@@ -14819,6 +14838,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rclrs"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62fcb68b31b17554f85f80aa807f9b4cd3b6abf201de78cb8fa9bc7ccf07e289"
+dependencies = [
+ "ament_rs",
+ "async-std",
+ "async-stream",
+ "cfg-if",
+ "futures 0.3.34",
+ "futures-lite 2.6.1",
+ "libloading",
+ "rosidl_runtime_rs",
+ "rustflags",
+ "tokio",
+ "tokio-stream",
+ "uuid",
+]
+
+[[package]]
 name = "rdrand"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15459,7 +15498,10 @@ name = "ros_studio_daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rclrs",
+ "ros_studio_model",
  "ros_studio_protocol",
+ "serde",
  "serde_json",
 ]
 
@@ -15511,6 +15553,15 @@ dependencies = [
  "serde_json",
  "ui",
  "workspace",
+]
+
+[[package]]
+name = "rosidl_runtime_rs"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24b1243b39e62b536c0d634d4f1bed8098b94c00920ddcef14b4bcced372e89d"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -15714,6 +15765,12 @@ checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
 ]
+
+[[package]]
+name = "rustflags"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a39e0e9135d7a7208ee80aa4e3e4b88f0f5ad7be92153ed70686c38a03db2e63"
 
 [[package]]
 name = "rustix"
