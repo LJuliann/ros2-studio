@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod design_live;
+
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]

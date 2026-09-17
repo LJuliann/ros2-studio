@@ -15543,7 +15543,10 @@ name = "ros_studio_zed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
+ "async-process",
  "editor",
+ "futures 0.3.34",
  "gpui",
  "project",
  "rope",
