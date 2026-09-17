@@ -15494,6 +15494,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ros_studio_codegen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ros_studio_model",
+ "ros_studio_scan",
+ "tempfile",
+ "toml_edit 0.22.27",
+]
+
+[[package]]
 name = "ros_studio_daemon"
 version = "0.1.0"
 dependencies = [
@@ -15548,8 +15559,10 @@ dependencies = [
  "editor",
  "futures 0.3.34",
  "gpui",
+ "multi_buffer",
  "project",
  "rope",
+ "ros_studio_codegen",
  "ros_studio_model",
  "ros_studio_protocol",
  "ros_studio_scan",
