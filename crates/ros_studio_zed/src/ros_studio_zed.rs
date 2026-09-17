@@ -16,12 +16,20 @@ use gpui::{
     WeakEntity, Window, actions, canvas, point,
 };
 use rope::Point as TextPoint;
-use ros_studio_model::{Confidence, EndpointKind, Project, RuntimeState, SourceLocation};
+use ros_studio_model::{
+    Confidence, EndpointKind, EntityId, Node, Package, Project, RuntimeState, SourceLocation,
+    design_live::{canonical_ros_type_name, reconcile_project},
+};
+use ros_studio_protocol::GraphPatch;
 use ui::{Button, Headline, HeadlineSize, Label, LabelSize, Tooltip, prelude::*};
 use workspace::{
     Pane, StatusItemView, Workspace,
     item::{Item, ItemEvent},
 };
+
+mod runtime_client;
+
+use runtime_client::RuntimeMessage;
 
 #[cfg(test)]
 const FIXTURE_GRAPH: &str = include_str!("../../../examples/drone_demo_ws/expected_graph.json");
@@ -90,6 +98,100 @@ struct GraphCanvasPan {
     mouse_start_y: f32,
     camera_start_x: f32,
     camera_start_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphMode {
+    Design,
+    Live,
+    Both,
+}
+
+impl GraphMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Design => "DESIGN",
+            Self::Live => "LIVE",
+            Self::Both => "BOTH",
+        }
+    }
+}
+
+enum RuntimeStatus {
+    NotStarted,
+    Connecting,
+    Ready,
+    Failed(String),
+}
+
+#[derive(Default)]
+struct RuntimeOverlay {
+    project_id: Option<EntityId>,
+    received_snapshot: bool,
+    packages: BTreeMap<EntityId, Package>,
+    nodes: BTreeMap<EntityId, Node>,
+}
+
+impl RuntimeOverlay {
+    fn apply_patch(&mut self, patch: GraphPatch, expected_project_id: &EntityId) -> bool {
+        if &patch.project_id != expected_project_id {
+            return false;
+        }
+
+        self.project_id = Some(patch.project_id);
+        self.received_snapshot = true;
+        for package in patch.upsert_packages {
+            self.packages.insert(package.id.clone(), package);
+        }
+        for package_id in patch.removed_package_ids {
+            self.packages.remove(&package_id);
+        }
+        for node in patch.upsert_nodes {
+            self.nodes.insert(node.id.clone(), node);
+        }
+        for node_id in patch.removed_node_ids {
+            self.nodes.remove(&node_id);
+        }
+        true
+    }
+
+    fn snapshot(&self, design: &Project) -> Option<Project> {
+        if !self.received_snapshot || self.project_id.as_ref() != Some(&design.id) {
+            return None;
+        }
+
+        Some(Project {
+            id: design.id.clone(),
+            name: design.name.clone(),
+            root_path: design.root_path.clone(),
+            packages: self.packages.values().cloned().collect(),
+            nodes: self.nodes.values().cloned().collect(),
+        })
+    }
+}
+
+fn project_for_mode(design: &Project, merged: &Project, mode: GraphMode) -> Project {
+    match mode {
+        GraphMode::Design => design.clone(),
+        GraphMode::Both => merged.clone(),
+        GraphMode::Live => {
+            let mut live = merged.clone();
+            live.nodes.retain(|node| {
+                matches!(
+                    node.runtime_state,
+                    RuntimeState::Online | RuntimeState::RuntimeOnly | RuntimeState::Conflict
+                )
+            });
+            let visible_package_ids = live
+                .nodes
+                .iter()
+                .map(|node| node.package_id.clone())
+                .collect::<BTreeSet<_>>();
+            live.packages
+                .retain(|package| visible_package_ids.contains(&package.id));
+            live
+        }
+    }
 }
 
 actions!(
@@ -202,6 +304,11 @@ pub struct RosGraph {
     workspace: WeakEntity<Workspace>,
     workspace_root: Option<PathBuf>,
     project: Result<Project, SharedString>,
+    displayed_project: Result<Project, SharedString>,
+    graph_mode: GraphMode,
+    runtime_status: RuntimeStatus,
+    runtime_diagnostic: Option<String>,
+    runtime_overlay: RuntimeOverlay,
     is_scanning: bool,
     node_layouts: Vec<GraphNodeLayout>,
     selected_node_id: Option<String>,
@@ -213,6 +320,7 @@ pub struct RosGraph {
     zoom_percent: u16,
     focus_handle: FocusHandle,
     _rescan_task: Task<()>,
+    _runtime_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -229,6 +337,11 @@ impl RosGraph {
             workspace,
             workspace_root,
             project: Err("Scanning ROS workspace…".into()),
+            displayed_project: Err("Scanning ROS workspace…".into()),
+            graph_mode: GraphMode::Design,
+            runtime_status: RuntimeStatus::NotStarted,
+            runtime_diagnostic: None,
+            runtime_overlay: RuntimeOverlay::default(),
             is_scanning: true,
             node_layouts: Vec::new(),
             selected_node_id: None,
@@ -240,6 +353,7 @@ impl RosGraph {
             zoom_percent: 100,
             focus_handle: cx.focus_handle(),
             _rescan_task: Task::ready(()),
+            _runtime_task: Task::ready(()),
             _subscriptions: subscriptions,
         };
         graph.schedule_rescan(Duration::ZERO, cx);
@@ -270,6 +384,7 @@ impl RosGraph {
     fn schedule_rescan(&mut self, delay: Duration, cx: &mut Context<Self>) {
         let Some(workspace_root) = self.workspace_root.clone() else {
             self.project = Err("No local workspace is open.".into());
+            self.displayed_project = self.project.clone();
             self.is_scanning = false;
             cx.notify();
             return;
@@ -306,20 +421,106 @@ impl RosGraph {
         self.is_scanning = false;
         match scan_result {
             Ok(project) => {
-                let edges = graph_edges(&project);
-                let viewport_center = self.visible_graph_center();
-                self.node_layouts =
-                    merge_graph_layouts(&self.node_layouts, &project, &edges, viewport_center);
-                self.selected_node_id = self.selected_node_id.take().filter(|selected_node_id| {
-                    project
-                        .nodes
-                        .iter()
-                        .any(|node| node.id.as_str() == selected_node_id.as_str())
-                });
                 self.project = Ok(project);
             }
             Err(error) => {
                 self.project = Err(format!("Failed to scan ROS workspace: {error:#}").into());
+            }
+        }
+        self.refresh_display();
+    }
+
+    fn refresh_display(&mut self) {
+        let Ok(design) = &self.project else {
+            self.displayed_project = self.project.clone();
+            return;
+        };
+
+        let runtime = self.runtime_overlay.snapshot(design);
+        let merged = reconcile_project(design, runtime.as_ref());
+        let edges = graph_edges(&merged);
+        let viewport_center = self.visible_graph_center();
+        self.node_layouts =
+            merge_graph_layouts(&self.node_layouts, &merged, &edges, viewport_center);
+        self.selected_node_id = self.selected_node_id.take().filter(|selected_node_id| {
+            merged
+                .nodes
+                .iter()
+                .any(|node| node.id.as_str() == selected_node_id.as_str())
+        });
+        self.displayed_project = Ok(project_for_mode(design, &merged, self.graph_mode));
+    }
+
+    fn set_graph_mode(&mut self, mode: GraphMode, cx: &mut Context<Self>) {
+        self.graph_mode = mode;
+        self.refresh_display();
+        if mode != GraphMode::Design
+            && matches!(
+                &self.runtime_status,
+                RuntimeStatus::NotStarted | RuntimeStatus::Failed(_)
+            )
+        {
+            self.start_runtime_discovery(cx);
+        }
+        cx.notify();
+    }
+
+    fn start_runtime_discovery(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_root) = self.workspace_root.clone() else {
+            self.runtime_status = RuntimeStatus::Failed("No local workspace is open".to_owned());
+            return;
+        };
+
+        self.runtime_overlay = RuntimeOverlay::default();
+        self.runtime_diagnostic = None;
+        self.runtime_status = RuntimeStatus::Connecting;
+        self.refresh_display();
+        let (sender, receiver) = async_channel::unbounded();
+        let process_task =
+            cx.background_spawn(
+                async move { runtime_client::discover(workspace_root, sender).await },
+            );
+        self._runtime_task = cx.spawn(async move |this, cx| {
+            while let Ok(message) = receiver.recv().await {
+                let Some(graph) = this.upgrade() else {
+                    return;
+                };
+                graph.update(cx, |graph, cx| {
+                    graph.handle_runtime_message(message);
+                    cx.notify();
+                });
+            }
+
+            let result = process_task.await;
+            if let Some(graph) = this.upgrade() {
+                graph.update(cx, |graph, cx| {
+                    graph.runtime_overlay = RuntimeOverlay::default();
+                    graph.runtime_status = RuntimeStatus::Failed(match result {
+                        Ok(()) => "ROS 2 daemon disconnected".to_owned(),
+                        Err(error) => format!("{error:#}"),
+                    });
+                    graph.refresh_display();
+                    cx.notify();
+                });
+            }
+        });
+    }
+
+    fn handle_runtime_message(&mut self, message: RuntimeMessage) {
+        match message {
+            RuntimeMessage::GraphPatch(patch) => {
+                let Some(project_id) = self.project.as_ref().ok().map(|project| project.id.clone())
+                else {
+                    return;
+                };
+                if self.runtime_overlay.apply_patch(patch, &project_id) {
+                    self.runtime_status = RuntimeStatus::Ready;
+                    self.runtime_diagnostic = None;
+                    self.refresh_display();
+                }
+            }
+            RuntimeMessage::Diagnostic(message) => {
+                self.runtime_diagnostic = Some(message);
             }
         }
     }
@@ -652,7 +853,8 @@ fn graph_edges(project: &Project) -> Vec<GraphEdge> {
                 for subscriber in subscriber_node.endpoints.iter().filter(|endpoint| {
                     endpoint.kind == EndpointKind::Subscription
                         && endpoint.name == publisher.name
-                        && endpoint.type_name == publisher.type_name
+                        && canonical_ros_type_name(&endpoint.type_name)
+                            == canonical_ros_type_name(&publisher.type_name)
                 }) {
                     edges.push(GraphEdge {
                         publisher_node_id: publisher_node.id.as_str().to_owned(),
@@ -667,6 +869,22 @@ fn graph_edges(project: &Project) -> Vec<GraphEdge> {
 
     edges.sort();
     edges
+}
+
+fn topic_count(project: &Project) -> usize {
+    project
+        .nodes
+        .iter()
+        .flat_map(|node| &node.endpoints)
+        .filter(|endpoint| {
+            matches!(
+                endpoint.kind,
+                EndpointKind::Publisher | EndpointKind::Subscription
+            )
+        })
+        .map(|endpoint| endpoint.name.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn graph_layout(project: &Project, edges: &[GraphEdge]) -> Vec<GraphNodeLayout> {
@@ -863,9 +1081,28 @@ fn runtime_state_label(runtime_state: RuntimeState) -> &'static str {
     match runtime_state {
         RuntimeState::Unknown => "Design only",
         RuntimeState::Online => "Online",
-        RuntimeState::Offline => "Offline",
+        RuntimeState::Offline => "Not detected in the current ROS graph",
         RuntimeState::RuntimeOnly => "Runtime only",
         RuntimeState::Conflict => "Conflict",
+    }
+}
+
+fn runtime_state_badge(runtime_state: RuntimeState) -> (&'static str, Color) {
+    match runtime_state {
+        RuntimeState::Unknown => ("DESIGN", Color::Muted),
+        RuntimeState::Online => ("LIVE", Color::Success),
+        RuntimeState::Offline => ("NOT SEEN", Color::Warning),
+        RuntimeState::RuntimeOnly => ("RUNTIME", Color::Info),
+        RuntimeState::Conflict => ("CONFLICT", Color::Conflict),
+    }
+}
+
+fn runtime_status_label(status: &RuntimeStatus) -> &'static str {
+    match status {
+        RuntimeStatus::NotStarted => "NOT CONNECTED",
+        RuntimeStatus::Connecting => "CONNECTING",
+        RuntimeStatus::Ready => "CONNECTED",
+        RuntimeStatus::Failed(_) => "UNAVAILABLE",
     }
 }
 
@@ -878,9 +1115,18 @@ fn source_location_label(source_location: &SourceLocation) -> String {
     )
 }
 
+fn node_subtitle(package_name: &str, executable: &str) -> String {
+    if executable.is_empty() {
+        package_name.to_owned()
+    } else {
+        format!("{package_name} · {executable}")
+    }
+}
+
 fn render_ros_inspector(
     project: &Project,
     selected_node_id: Option<&str>,
+    mode: GraphMode,
     cx: &mut Context<RosGraph>,
 ) -> Div {
     let panel = v_flex()
@@ -899,7 +1145,7 @@ fn render_ros_inspector(
                 .justify_between()
                 .child(Headline::new("Inspector").size(HeadlineSize::Small))
                 .child(
-                    Label::new("DESIGN")
+                    Label::new(mode.label())
                         .size(LabelSize::XSmall)
                         .color(Color::Accent),
                 ),
@@ -945,14 +1191,14 @@ fn render_ros_inspector(
                 .gap_1()
                 .child(Headline::new(node.logical_name.clone()).size(HeadlineSize::Small))
                 .child(
-                    Label::new(format!("{package_name} · {}", node.executable))
+                    Label::new(node_subtitle(package_name, &node.executable))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
                 .child(
                     Label::new(runtime_state_label(node.runtime_state))
                         .size(LabelSize::XSmall)
-                        .color(Color::Accent),
+                        .color(runtime_state_badge(node.runtime_state).1),
                 ),
         )
         .child(
@@ -1098,9 +1344,18 @@ impl Render for RosGraph {
             .gap_3()
             .bg(cx.theme().colors().editor_background);
 
-        match &self.project {
+        match &self.displayed_project {
             Ok(project) => {
                 let selected_node_id = self.selected_node_id.clone();
+                let graph_mode = self.graph_mode;
+                let runtime_hint = if graph_mode == GraphMode::Design {
+                    None
+                } else {
+                    match &self.runtime_status {
+                        RuntimeStatus::Failed(error) => Some(format!("Live unavailable: {error}")),
+                        _ => self.runtime_diagnostic.clone(),
+                    }
+                };
                 let zoom_percent = self.zoom_percent;
                 let zoom_scale = f32::from(zoom_percent) / 100.0;
                 let edges = graph_edges(project);
@@ -1147,10 +1402,19 @@ impl Render for RosGraph {
                                                     .size(HeadlineSize::Large),
                                             )
                                             .child(
-                                                Label::new("DESIGN")
+                                                Label::new(graph_mode.label())
                                                     .size(LabelSize::XSmall)
                                                     .color(Color::Accent),
                                             )
+                                            .when(graph_mode != GraphMode::Design, |header| {
+                                                header.child(
+                                                    Label::new(runtime_status_label(
+                                                        &self.runtime_status,
+                                                    ))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                                )
+                                            })
                                             .when(self.is_scanning, |header| {
                                                 header.child(
                                                     Label::new("SCANNING")
@@ -1165,50 +1429,85 @@ impl Render for RosGraph {
                                             project.name,
                                             project.packages.len(),
                                             project.nodes.len(),
-                                            edges.len(),
+                                            topic_count(project),
                                         ))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
-                                    ),
+                                    )
+                                    .when_some(runtime_hint, |header, hint| {
+                                        header.child(
+                                            Label::new(hint)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning)
+                                                .truncate_middle(),
+                                        )
+                                    }),
                             )
                             .child(
                                 h_flex()
-                                    .gap_1()
+                                    .gap_3()
                                     .child(
-                                        Button::new("ros-graph-zoom-out", "−")
-                                            .disabled(zoom_percent <= MINIMUM_ZOOM_PERCENT)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.zoom_percent = this
-                                                    .zoom_percent
-                                                    .saturating_sub(ZOOM_STEP_PERCENT)
-                                                    .max(MINIMUM_ZOOM_PERCENT);
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("ros-graph-mode-design", "Design")
+                                                    .toggle_state(graph_mode == GraphMode::Design)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.set_graph_mode(GraphMode::Design, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-mode-live", "Live")
+                                                    .toggle_state(graph_mode == GraphMode::Live)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.set_graph_mode(GraphMode::Live, cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-mode-both", "Both")
+                                                    .toggle_state(graph_mode == GraphMode::Both)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.set_graph_mode(GraphMode::Both, cx);
+                                                    })),
+                                            ),
                                     )
                                     .child(
-                                        Button::new(
-                                            "ros-graph-reset-zoom",
-                                            format!("{zoom_percent}%"),
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.zoom_percent = 100;
-                                                this.camera_offset_x = 0.0;
-                                                this.camera_offset_y = 0.0;
-                                                cx.notify();
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        Button::new("ros-graph-zoom-in", "+")
-                                            .disabled(zoom_percent >= MAXIMUM_ZOOM_PERCENT)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.zoom_percent = this
-                                                    .zoom_percent
-                                                    .saturating_add(ZOOM_STEP_PERCENT)
-                                                    .min(MAXIMUM_ZOOM_PERCENT);
-                                                cx.notify();
-                                            })),
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("ros-graph-zoom-out", "−")
+                                                    .disabled(zoom_percent <= MINIMUM_ZOOM_PERCENT)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.zoom_percent = this
+                                                            .zoom_percent
+                                                            .saturating_sub(ZOOM_STEP_PERCENT)
+                                                            .max(MINIMUM_ZOOM_PERCENT);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "ros-graph-reset-zoom",
+                                                    format!("{zoom_percent}%"),
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.zoom_percent = 100;
+                                                    this.camera_offset_x = 0.0;
+                                                    this.camera_offset_y = 0.0;
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-zoom-in", "+")
+                                                    .disabled(zoom_percent >= MAXIMUM_ZOOM_PERCENT)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.zoom_percent = this
+                                                            .zoom_percent
+                                                            .saturating_add(ZOOM_STEP_PERCENT)
+                                                            .min(MAXIMUM_ZOOM_PERCENT);
+                                                        cx.notify();
+                                                    })),
+                                            ),
                                     ),
                             ),
                     )
@@ -1587,16 +1886,20 @@ impl Render for RosGraph {
                                                                 )
                                                                 .size(HeadlineSize::Small),
                                                             )
-                                                            .child(
-                                                                Label::new("DESIGN")
+                                                            .child({
+                                                                let (badge, color) =
+                                                                    runtime_state_badge(
+                                                                        node.runtime_state,
+                                                                    );
+                                                                Label::new(badge)
                                                                     .size(LabelSize::XSmall)
-                                                                    .color(Color::Muted),
-                                                            ),
+                                                                    .color(color)
+                                                            }),
                                                     )
                                                     .child(
-                                                        Label::new(format!(
-                                                            "{package_name} · {}",
-                                                            node.executable,
+                                                        Label::new(node_subtitle(
+                                                            package_name,
+                                                            &node.executable,
                                                         ))
                                                         .size(LabelSize::XSmall)
                                                         .color(Color::Muted),
@@ -1704,6 +2007,7 @@ impl Render for RosGraph {
                             .child(render_ros_inspector(
                                 project,
                                 selected_node_id.as_deref(),
+                                graph_mode,
                                 cx,
                             )),
                     )
@@ -1921,6 +2225,163 @@ mod tests {
                     label_y: 468.0,
                 },
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn applies_runtime_patches_without_changing_design_node_identity() -> anyhow::Result<()> {
+        let design = load_fixture_project()?;
+        let mut overlay = RuntimeOverlay::default();
+        assert!(overlay.snapshot(&design).is_none());
+
+        let mut live_camera = design
+            .nodes
+            .iter()
+            .find(|node| node.logical_name == "camera")
+            .context("fixture should contain a camera")?
+            .clone();
+        live_camera.id = EntityId::new("node:runtime:/camera");
+        live_camera.logical_name = "/camera".to_owned();
+        live_camera.package_id = EntityId::new("package:runtime");
+        live_camera.source_locations.clear();
+        live_camera.runtime_state = RuntimeState::Online;
+
+        assert!(!overlay.apply_patch(
+            GraphPatch {
+                project_id: EntityId::new("project:other"),
+                upsert_packages: Vec::new(),
+                removed_package_ids: Vec::new(),
+                upsert_nodes: vec![live_camera.clone()],
+                removed_node_ids: Vec::new(),
+            },
+            &design.id,
+        ));
+        assert!(overlay.snapshot(&design).is_none());
+
+        assert!(overlay.apply_patch(
+            GraphPatch {
+                project_id: design.id.clone(),
+                upsert_packages: vec![Package {
+                    id: EntityId::new("package:runtime"),
+                    name: "Runtime".to_owned(),
+                    path: String::new(),
+                }],
+                removed_package_ids: Vec::new(),
+                upsert_nodes: vec![live_camera.clone()],
+                removed_node_ids: Vec::new(),
+            },
+            &design.id,
+        ));
+
+        let snapshot = overlay
+            .snapshot(&design)
+            .context("runtime snapshot should exist")?;
+        let merged = reconcile_project(&design, Some(&snapshot));
+        let camera = merged
+            .nodes
+            .iter()
+            .find(|node| node.logical_name == "camera")
+            .context("merged camera should retain its design name")?;
+        assert_eq!(camera.runtime_state, RuntimeState::Online);
+        assert_eq!(
+            camera.id.as_str(),
+            "node:camera:src/camera/src/camera.rs:node"
+        );
+        assert_eq!(
+            project_for_mode(&design, &merged, GraphMode::Design),
+            design
+        );
+        assert_eq!(
+            project_for_mode(&design, &merged, GraphMode::Live)
+                .nodes
+                .len(),
+            1
+        );
+        assert_eq!(
+            project_for_mode(&design, &merged, GraphMode::Both)
+                .nodes
+                .len(),
+            4
+        );
+
+        assert!(overlay.apply_patch(
+            GraphPatch {
+                project_id: design.id.clone(),
+                upsert_packages: Vec::new(),
+                removed_package_ids: Vec::new(),
+                upsert_nodes: Vec::new(),
+                removed_node_ids: vec![live_camera.id],
+            },
+            &design.id,
+        ));
+        let snapshot = overlay
+            .snapshot(&design)
+            .context("empty runtime snapshot should exist")?;
+        let merged = reconcile_project(&design, Some(&snapshot));
+        assert!(
+            merged
+                .nodes
+                .iter()
+                .all(|node| node.runtime_state == RuntimeState::Offline)
+        );
+        assert!(
+            project_for_mode(&design, &merged, GraphMode::Live)
+                .nodes
+                .is_empty()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn graph_edges_match_equivalent_ros_type_spellings() -> anyhow::Result<()> {
+        let mut project = load_fixture_project()?;
+        let detector = project
+            .nodes
+            .iter_mut()
+            .find(|node| node.logical_name == "detector")
+            .context("fixture should contain a detector")?;
+        let subscription = detector
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.kind == EndpointKind::Subscription)
+            .context("detector should subscribe to the camera image")?;
+        subscription.type_name = "sensor_msgs/msg/Image".to_owned();
+
+        assert!(graph_edges(&project).iter().any(|edge| {
+            edge.topic == "/camera/image"
+                && edge.publisher_node_id.contains("camera")
+                && edge.subscriber_node_id.contains("detector")
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn counts_topics_even_without_a_subscriber() -> anyhow::Result<()> {
+        let mut project = load_fixture_project()?;
+        assert_eq!(topic_count(&project), 3);
+
+        let camera = project
+            .nodes
+            .iter_mut()
+            .find(|node| node.logical_name == "camera")
+            .context("fixture should contain a camera")?;
+        let mut publisher = camera
+            .endpoints
+            .first()
+            .context("camera should publish an image")?
+            .clone();
+        publisher.name = "/ros_studio_smoke".to_owned();
+        camera.endpoints.push(publisher);
+
+        assert_eq!(topic_count(&project), 4);
+        assert_eq!(node_subtitle("Runtime", ""), "Runtime");
+        assert_eq!(
+            node_subtitle("camera", "camera_node"),
+            "camera · camera_node"
         );
 
         Ok(())
