@@ -17,8 +17,13 @@ name = "ros-studio-daemon"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+rclrs = { version = "0.7", optional = true }
+ros_studio_model.workspace = true
 ros_studio_protocol.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-anyhow.workspace = true
+[features]
+default = []
+ros-runtime = ["dep:rclrs"]
