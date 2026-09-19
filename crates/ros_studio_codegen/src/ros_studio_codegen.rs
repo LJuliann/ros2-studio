@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -8,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail, ensure};
-use ros_studio_model::{EntityId, Project};
+use ros_studio_model::{EndpointKind, EntityId, Project};
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +40,119 @@ pub enum ApiDetection {
     Supported(RclrsApi),
     Unknown(String),
     Unsupported(String),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct NodeInterface {
+    pub kind: EndpointKind,
+    pub name: String,
+    pub type_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopicOption {
+    pub name: String,
+    pub type_name: String,
+    pub publishers: Vec<String>,
+    pub subscribers: Vec<String>,
+}
+
+pub fn available_topics(project: &Project) -> Vec<TopicOption> {
+    let mut topics = BTreeMap::<(String, String), (BTreeSet<String>, BTreeSet<String>)>::new();
+    for node in &project.nodes {
+        for endpoint in &node.endpoints {
+            if !matches!(
+                endpoint.kind,
+                EndpointKind::Publisher | EndpointKind::Subscription
+            ) {
+                continue;
+            }
+            let Some(type_name) = canonical_message_type(&endpoint.type_name) else {
+                continue;
+            };
+            let (publishers, subscribers) = topics
+                .entry((endpoint.name.clone(), type_name))
+                .or_default();
+            match endpoint.kind {
+                EndpointKind::Publisher => {
+                    publishers.insert(node.logical_name.clone());
+                }
+                EndpointKind::Subscription => {
+                    subscribers.insert(node.logical_name.clone());
+                }
+                _ => continue,
+            }
+        }
+    }
+    topics
+        .into_iter()
+        .map(
+            |((name, type_name), (publishers, subscribers))| TopicOption {
+                name,
+                type_name,
+                publishers: publishers.into_iter().collect(),
+                subscribers: subscribers.into_iter().collect(),
+            },
+        )
+        .collect()
+}
+
+fn canonical_message_type(type_name: &str) -> Option<String> {
+    let parts = if type_name.contains("::") {
+        type_name.split("::").collect::<Vec<_>>()
+    } else {
+        type_name.split('/').collect::<Vec<_>>()
+    };
+    let [package, "msg", message] = parts.as_slice() else {
+        return None;
+    };
+    if !valid_rust_identifier(package) || !valid_rust_identifier(message) {
+        return None;
+    }
+    Some(format!("{package}::msg::{message}"))
+}
+
+fn valid_rust_identifier(identifier: &str) -> bool {
+    valid_node_name(identifier)
+        && !matches!(
+            identifier,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
 }
 
 pub fn detect_rclrs_api(project: &Project, package_id: &EntityId) -> anyhow::Result<ApiDetection> {
@@ -96,13 +210,7 @@ fn dependency_workspace(dependency: &Item) -> bool {
 }
 
 fn detect_dependency(dependency: &Item) -> ApiDetection {
-    let version = match dependency {
-        Item::Value(Value::String(version)) => Some(version.value().as_str()),
-        Item::Value(Value::InlineTable(table)) => table.get("version").and_then(Value::as_str),
-        Item::Table(table) => table.get("version").and_then(Item::as_str),
-        _ => None,
-    };
-    let Some(version) = version else {
+    let Some(version) = dependency_version(dependency) else {
         return ApiDetection::Unknown("rclrs version is not declared explicitly".into());
     };
     let normalized = version.trim().trim_start_matches(['^', '~', '=']).trim();
@@ -123,6 +231,15 @@ fn detect_dependency(dependency: &Item) -> ApiDetection {
         None => {
             ApiDetection::Unsupported(format!("unsupported or ambiguous rclrs version: {version}"))
         }
+    }
+}
+
+fn dependency_version(dependency: &Item) -> Option<&str> {
+    match dependency {
+        Item::Value(Value::String(version)) => Some(version.value().as_str()),
+        Item::Value(Value::InlineTable(table)) => table.get("version").and_then(Value::as_str),
+        Item::Table(table) => table.get("version").and_then(Item::as_str),
+        _ => None,
     }
 }
 
@@ -156,6 +273,16 @@ pub fn preview_node_with_api(
     package_id: &EntityId,
     node_name: &str,
     selection: ApiSelection,
+) -> anyhow::Result<NodePreview> {
+    preview_node_with_interfaces(project, package_id, node_name, selection, &[])
+}
+
+pub fn preview_node_with_interfaces(
+    project: &Project,
+    package_id: &EntityId,
+    node_name: &str,
+    selection: ApiSelection,
+    interfaces: &[NodeInterface],
 ) -> anyhow::Result<NodePreview> {
     ensure!(
         valid_node_name(node_name),
@@ -262,6 +389,38 @@ pub fn preview_node_with_api(
         (ApiSelection::Manual(api), _) => api,
     };
 
+    if !interfaces.is_empty() {
+        ensure!(
+            api == RclrsApi::V07,
+            "Typed pub/sub generation currently requires rclrs 0.7; create the node without interfaces or use a 0.7 package"
+        );
+    }
+    let available = available_topics(project);
+    let mut unique_interfaces = BTreeSet::new();
+    for interface in interfaces {
+        ensure!(
+            matches!(
+                interface.kind,
+                EndpointKind::Publisher | EndpointKind::Subscription
+            ),
+            "Only publishers and subscriptions are supported"
+        );
+        ensure!(
+            available.iter().any(|topic| {
+                topic.name == interface.name && topic.type_name == interface.type_name
+            }),
+            "Topic {} ({}) is no longer in the project",
+            interface.name,
+            interface.type_name
+        );
+        ensure!(
+            unique_interfaces.insert(interface.clone()),
+            "Duplicate interface selected: {} ({})",
+            interface.name,
+            interface.type_name
+        );
+    }
+
     if manifest.as_table().get("dependencies").is_none() {
         manifest["dependencies"] = Item::Table(Table::new());
     }
@@ -274,6 +433,23 @@ pub fn preview_node_with_api(
     if dependencies.get("anyhow").is_none() {
         dependencies["anyhow"] = value("1.0");
     }
+    if !interfaces.is_empty() {
+        if let Some(ros_env_dependency) = dependencies.get("ros-env") {
+            let version = dependency_version(ros_env_dependency)
+                .context("Existing ros-env dependency has no explicit version; typed pub/sub requires ros-env 0.2")?;
+            let version = version.trim().trim_start_matches(['^', '~', '=']).trim();
+            ensure!(
+                version == "0.2"
+                    || version
+                        .strip_prefix("0.2.")
+                        .is_some_and(|patch| !patch.is_empty()
+                            && patch.bytes().all(|byte| byte.is_ascii_digit())),
+                "Existing ros-env version {version} is incompatible with rclrs 0.7; expected 0.2"
+            );
+        } else {
+            dependencies["ros-env"] = value("0.2");
+        }
+    }
 
     let source_relative_path = source_path.strip_prefix(&workspace_root)?.to_path_buf();
     let manifest_relative_path = manifest_path.strip_prefix(&workspace_root)?.to_path_buf();
@@ -281,9 +457,7 @@ pub fn preview_node_with_api(
     Ok(NodePreview {
         source_relative_path,
         manifest_relative_path,
-        source: format!(
-            "use rclrs::{{CreateBasicExecutor, RclrsErrorFilter, SpinOptions}};\n\nfn main() -> anyhow::Result<()> {{\n    let context = rclrs::Context::default_from_env()?;\n    let mut executor = context.create_basic_executor();\n    let _node = executor.create_node(\"{node_name}\")?;\n\n    executor.spin(SpinOptions::default()).first_error()?;\n    Ok(())\n}}\n"
-        ),
+        source: render_node_source(node_name, &unique_interfaces),
         manifest_before,
         manifest_after: manifest.to_string(),
         api_note: match (selection, &detection) {
@@ -298,6 +472,88 @@ pub fn preview_node_with_api(
         source_path,
         manifest_path,
     })
+}
+
+fn render_node_source(node_name: &str, interfaces: &BTreeSet<NodeInterface>) -> String {
+    let mut source =
+        String::from("use rclrs::{CreateBasicExecutor, RclrsErrorFilter, SpinOptions};\n");
+    let message_packages = interfaces
+        .iter()
+        .filter_map(|interface| interface.type_name.split("::").next())
+        .collect::<BTreeSet<_>>();
+    if !message_packages.is_empty() {
+        source.push_str(&format!(
+            "use ros_env::{{{}}};\n",
+            message_packages.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let node_binding = if interfaces.is_empty() {
+        "_node"
+    } else {
+        "node"
+    };
+    source.push_str(&format!(
+        "\nfn main() -> anyhow::Result<()> {{\n    let context = rclrs::Context::default_from_env()?;\n    let mut executor = context.create_basic_executor();\n    let {node_binding} = executor.create_node(\"{node_name}\")?;\n\n"
+    ));
+    source.push_str("    // ros-studio:interfaces:start\n");
+    let mut used_bindings = BTreeSet::new();
+    let mut interface_bindings = Vec::new();
+    for interface in interfaces {
+        let role = match interface.kind {
+            EndpointKind::Publisher => "publisher",
+            EndpointKind::Subscription => "subscriber",
+            _ => continue,
+        };
+        let base_binding = format!("{role}_{}", topic_identifier(&interface.name));
+        let mut binding = base_binding.clone();
+        let mut suffix = 2;
+        while !used_bindings.insert(binding.clone()) {
+            binding = format!("{base_binding}_{suffix}");
+            suffix += 1;
+        }
+        let topic = format!("{:?}", interface.name);
+        match interface.kind {
+            EndpointKind::Publisher => source.push_str(&format!(
+                "    let {binding} = node.create_publisher::<{}>({topic})?;\n",
+                interface.type_name
+            )),
+            EndpointKind::Subscription => source.push_str(&format!(
+                "    let {binding} = node.create_subscription::<{}, _>({topic}, move |_message| {{}})?;\n",
+                interface.type_name
+            )),
+            _ => {}
+        }
+        interface_bindings.push(binding);
+    }
+    if !interface_bindings.is_empty() {
+        source.push_str("    let _ros_interfaces = (\n");
+        for binding in interface_bindings {
+            source.push_str(&format!("        {binding},\n"));
+        }
+        source.push_str("    );\n");
+    }
+    source.push_str("    // ros-studio:interfaces:end\n\n");
+    source.push_str("    executor.spin(SpinOptions::default()).first_error()?;\n    Ok(())\n}\n");
+    source
+}
+
+fn topic_identifier(topic: &str) -> String {
+    let mut identifier = String::new();
+    for character in topic.chars() {
+        if character.is_ascii_alphanumeric() {
+            identifier.push(character.to_ascii_lowercase());
+        } else if !identifier.is_empty() && !identifier.ends_with('_') {
+            identifier.push('_');
+        }
+    }
+    while identifier.ends_with('_') {
+        identifier.pop();
+    }
+    if identifier.is_empty() {
+        "topic".to_owned()
+    } else {
+        identifier
+    }
 }
 
 pub fn write_node(preview: &NodePreview) -> anyhow::Result<PathBuf> {
@@ -373,7 +629,7 @@ fn valid_node_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ros_studio_model::Package;
+    use ros_studio_model::{Confidence, Endpoint, Node, Package, RuntimeState};
 
     fn fixture(root: &Path) -> anyhow::Result<Project> {
         let package_root = root.join("src/camera");
@@ -397,6 +653,40 @@ mod tests {
             }],
             nodes: Vec::new(),
         })
+    }
+
+    fn fixture_with_topics(root: &Path) -> anyhow::Result<Project> {
+        let mut project = fixture(root)?;
+        project.nodes.push(Node {
+            id: EntityId::new("node:fixture:camera"),
+            logical_name: "camera".to_owned(),
+            package_id: project.packages[0].id.clone(),
+            executable: "camera".to_owned(),
+            source_locations: Vec::new(),
+            endpoints: vec![
+                Endpoint {
+                    id: EntityId::new("endpoint:fixture:camera:image"),
+                    kind: EndpointKind::Publisher,
+                    name: "/camera/image".to_owned(),
+                    type_name: "sensor_msgs::msg::Image".to_owned(),
+                    source_location: None,
+                    confidence: Confidence::ConfirmedSource,
+                    evidence: Vec::new(),
+                },
+                Endpoint {
+                    id: EntityId::new("endpoint:fixture:camera:status"),
+                    kind: EndpointKind::Subscription,
+                    name: "/camera/status".to_owned(),
+                    type_name: "std_msgs/msg/String".to_owned(),
+                    source_location: None,
+                    confidence: Confidence::ConfirmedSource,
+                    evidence: Vec::new(),
+                },
+            ],
+            evidence: Vec::new(),
+            runtime_state: RuntimeState::Unknown,
+        });
+        Ok(project)
     }
 
     #[test]
@@ -578,6 +868,149 @@ mod tests {
                 &project.packages[0].id,
                 "backup",
                 ApiSelection::Manual(RclrsApi::V07)
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generates_existing_typed_interfaces_and_scans_them() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = fixture_with_topics(root.path())?;
+        let topics = available_topics(&project);
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].publishers, vec!["camera"]);
+        assert_eq!(topics[1].type_name, "std_msgs::msg::String");
+        let interfaces = vec![
+            NodeInterface {
+                kind: EndpointKind::Subscription,
+                name: "/camera/image".to_owned(),
+                type_name: "sensor_msgs::msg::Image".to_owned(),
+            },
+            NodeInterface {
+                kind: EndpointKind::Publisher,
+                name: "/camera/status".to_owned(),
+                type_name: "std_msgs::msg::String".to_owned(),
+            },
+        ];
+        let preview = preview_node_with_interfaces(
+            &project,
+            &project.packages[0].id,
+            "observer",
+            ApiSelection::Auto,
+            &interfaces,
+        )?;
+        assert!(preview.manifest_after.contains("ros-env = \"0.2\""));
+        assert!(
+            preview
+                .source
+                .contains("use ros_env::{sensor_msgs, std_msgs};")
+        );
+        assert!(preview.source.contains("ros-studio:interfaces:start"));
+        assert!(preview.source.contains("let subscriber_camera_image ="));
+        assert!(preview.source.contains("let publisher_camera_status ="));
+        assert!(preview.source.contains("let _ros_interfaces = ("));
+        assert!(preview.source.contains(
+            "create_subscription::<sensor_msgs::msg::Image, _>(\"/camera/image\", move |_message| {})?;"
+        ));
+        assert!(
+            preview
+                .source
+                .contains("create_publisher::<std_msgs::msg::String>(\"/camera/status\")")
+        );
+        write_node(&preview)?;
+        let scanned = ros_studio_scan::scan_project(root.path(), "test")?;
+        assert_eq!(scanned.nodes.len(), 1);
+        assert_eq!(scanned.nodes[0].endpoints.len(), 2);
+        assert!(scanned.nodes[0].endpoints.iter().any(|endpoint| {
+            endpoint.kind == EndpointKind::Subscription
+                && endpoint.name == "/camera/image"
+                && endpoint.type_name == "sensor_msgs::msg::Image"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn gives_interface_bindings_descriptive_unique_names() {
+        let interfaces = BTreeSet::from([
+            NodeInterface {
+                kind: EndpointKind::Subscription,
+                name: "/camera/image".to_owned(),
+                type_name: "sensor_msgs::msg::Image".to_owned(),
+            },
+            NodeInterface {
+                kind: EndpointKind::Subscription,
+                name: "/camera-image".to_owned(),
+                type_name: "sensor_msgs::msg::Image".to_owned(),
+            },
+        ]);
+        let source = render_node_source("observer", &interfaces);
+        assert!(source.contains("let subscriber_camera_image ="));
+        assert!(source.contains("let subscriber_camera_image_2 ="));
+        assert!(source.contains("        subscriber_camera_image,"));
+        assert!(source.contains("        subscriber_camera_image_2,"));
+        assert_eq!(topic_identifier("/camera/image_raw"), "camera_image_raw");
+        assert_eq!(topic_identifier("///"), "topic");
+    }
+
+    #[test]
+    fn refuses_unknown_topics_and_rclrs_06_typed_interfaces() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = fixture_with_topics(root.path())?;
+        let selected = [NodeInterface {
+            kind: EndpointKind::Subscription,
+            name: "/missing".to_owned(),
+            type_name: "sensor_msgs::msg::Image".to_owned(),
+        }];
+        assert!(
+            preview_node_with_interfaces(
+                &project,
+                &project.packages[0].id,
+                "observer",
+                ApiSelection::Auto,
+                &selected,
+            )
+            .is_err()
+        );
+        let selected = [NodeInterface {
+            kind: EndpointKind::Subscription,
+            name: "/camera/image".to_owned(),
+            type_name: "sensor_msgs::msg::Image".to_owned(),
+        }];
+        assert!(
+            preview_node_with_interfaces(
+                &project,
+                &project.packages[0].id,
+                "observer",
+                ApiSelection::Manual(RclrsApi::V06),
+                &selected,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_incompatible_existing_ros_env_dependency() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = fixture_with_topics(root.path())?;
+        fs::write(
+            root.path().join("src/camera/Cargo.toml"),
+            "[package]\nname = \"camera\"\nversion = \"0.1.0\"\n[dependencies]\nrclrs = \"0.7\"\nros-env = \"0.1\"\n",
+        )?;
+        let selected = [NodeInterface {
+            kind: EndpointKind::Subscription,
+            name: "/camera/image".to_owned(),
+            type_name: "sensor_msgs::msg::Image".to_owned(),
+        }];
+        assert!(
+            preview_node_with_interfaces(
+                &project,
+                &project.packages[0].id,
+                "observer",
+                ApiSelection::Auto,
+                &selected,
             )
             .is_err()
         );
