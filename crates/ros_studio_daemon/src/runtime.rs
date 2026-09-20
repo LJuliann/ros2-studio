@@ -1,8 +1,10 @@
 use std::{
     io::{self, BufRead, Write},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -17,6 +19,7 @@ use ros_studio_protocol::{
 };
 use serde::Serialize;
 
+use crate::process::ProcessWorker;
 use crate::runtime_graph::{
     RuntimeEndpointInfo, RuntimeGraph, RuntimeNodeInfo, project_id_for_workspace,
 };
@@ -102,18 +105,55 @@ impl RuntimeWorker {
 
 pub fn serve_ros_stdio() -> io::Result<()> {
     let output = Arc::new(Mutex::new(io::stdout()));
+    let (process_event_sender, process_event_receiver) = mpsc::channel();
+    let process_event_writer = thread::spawn({
+        let output = output.clone();
+        move || {
+            for event in process_event_receiver {
+                write_message(&output, &EventMessage::new(event))?;
+            }
+            io::Result::Ok(())
+        }
+    });
     let stdin = io::stdin();
     let mut project_id = None;
+    let mut workspace_root = None;
     let mut worker: Option<RuntimeWorker> = None;
+    let mut processes = Vec::new();
 
     for line in stdin.lock().lines() {
         let line = line?;
-        let response = match serde_json::from_str::<RequestMessage>(&line) {
-            Ok(message) => handle_request(message, &mut project_id, &mut worker, &output),
-            Err(error) => crate::malformed_request(&line, &error),
+        reap_finished_processes(&mut processes).map_err(io::Error::other)?;
+        let (response, process_to_activate) = match serde_json::from_str::<RequestMessage>(&line) {
+            Ok(message) => handle_request(
+                message,
+                &mut project_id,
+                &mut workspace_root,
+                &mut worker,
+                &mut processes,
+                &process_event_sender,
+                &output,
+            ),
+            Err(error) => (crate::malformed_request(&line, &error), None),
         };
 
         write_message(&output, &response)?;
+        if let Some(process_id) = process_to_activate {
+            let activation_result = processes
+                .iter()
+                .find(|process| process.id() == process_id)
+                .context("newly launched process is missing")
+                .and_then(ProcessWorker::activate);
+            if let Err(error) = activation_result {
+                process_event_sender
+                    .send(Event::Diagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        message: error.to_string(),
+                        source_location: None,
+                    })
+                    .map_err(io::Error::other)?;
+            }
+        }
     }
 
     if let Some(worker) = worker {
@@ -121,6 +161,11 @@ pub fn serve_ros_stdio() -> io::Result<()> {
             .stop()
             .map_err(|error| io::Error::other(error.to_string()))?;
     }
+    stop_processes(&mut processes).map_err(io::Error::other)?;
+    drop(process_event_sender);
+    process_event_writer
+        .join()
+        .map_err(|_| io::Error::other("process event writer thread panicked"))??;
 
     Ok(())
 }
@@ -128,39 +173,65 @@ pub fn serve_ros_stdio() -> io::Result<()> {
 fn handle_request(
     message: RequestMessage,
     project_id: &mut Option<EntityId>,
+    workspace_root: &mut Option<PathBuf>,
     worker: &mut Option<RuntimeWorker>,
+    processes: &mut Vec<ProcessWorker>,
+    process_events: &Sender<Event>,
     output: &SharedOutput,
-) -> ResponseMessage {
+) -> (ResponseMessage, Option<String>) {
     if let Err(error) = message.validate() {
-        return ResponseMessage::error(
-            Some(message.id),
-            UNSUPPORTED_PROTOCOL_VERSION,
-            error.to_string(),
+        return (
+            ResponseMessage::error(
+                Some(message.id),
+                UNSUPPORTED_PROTOCOL_VERSION,
+                error.to_string(),
+            ),
+            None,
         );
     }
 
     match message.request {
         Request::OpenWorkspace { path } => {
             let Some(next_project_id) = project_id_for_workspace(&path) else {
-                return ResponseMessage::error(
-                    Some(message.id),
-                    INVALID_PARAMS,
-                    "workspace path has no valid name",
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        INVALID_PARAMS,
+                        "workspace path has no valid name",
+                    ),
+                    None,
                 );
             };
 
             if let Some(active_worker) = worker.take()
                 && let Err(error) = active_worker.stop()
             {
-                return ResponseMessage::error(
-                    Some(message.id),
-                    CAPABILITY_UNAVAILABLE,
-                    error.to_string(),
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
+                );
+            }
+            if let Err(error) = stop_processes(processes) {
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
                 );
             }
 
             *project_id = Some(next_project_id);
-            ResponseMessage::success(message.id, ResponseResult::Accepted {})
+            *workspace_root = Some(PathBuf::from(path));
+            (
+                ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                None,
+            )
         }
         Request::StartRuntimeDiscovery {} => {
             if worker
@@ -169,34 +240,49 @@ fn handle_request(
                 && let Some(finished_worker) = worker.take()
                 && let Err(error) = finished_worker.stop()
             {
-                return ResponseMessage::error(
-                    Some(message.id),
-                    CAPABILITY_UNAVAILABLE,
-                    error.to_string(),
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
                 );
             }
 
             if worker.is_some() {
-                return ResponseMessage::success(message.id, ResponseResult::Accepted {});
+                return (
+                    ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                    None,
+                );
             }
 
             let Some(project_id) = project_id.clone() else {
-                return ResponseMessage::error(
-                    Some(message.id),
-                    INVALID_PARAMS,
-                    "open a workspace before starting ROS discovery",
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        INVALID_PARAMS,
+                        "open a workspace before starting ROS discovery",
+                    ),
+                    None,
                 );
             };
 
             match RuntimeWorker::start(project_id, output.clone()) {
                 Ok(started_worker) => {
                     *worker = Some(started_worker);
-                    ResponseMessage::success(message.id, ResponseResult::Accepted {})
+                    (
+                        ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                        None,
+                    )
                 }
-                Err(error) => ResponseMessage::error(
-                    Some(message.id),
-                    CAPABILITY_UNAVAILABLE,
-                    error.to_string(),
+                Err(error) => (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
                 ),
             }
         }
@@ -204,22 +290,113 @@ fn handle_request(
             if let Some(active_worker) = worker.take()
                 && let Err(error) = active_worker.stop()
             {
-                return ResponseMessage::error(
-                    Some(message.id),
-                    CAPABILITY_UNAVAILABLE,
-                    error.to_string(),
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
                 );
             }
 
-            ResponseMessage::success(message.id, ResponseResult::Accepted {})
+            (
+                ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                None,
+            )
         }
-        Request::Launch { .. } | Request::GetParameters { .. } | Request::SetParameter { .. } => {
+        Request::Launch { command, env } => {
+            let Some(workspace_root) = workspace_root.as_deref() else {
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        INVALID_PARAMS,
+                        "open a workspace before launching a process",
+                    ),
+                    None,
+                );
+            };
+            match ProcessWorker::start(command, env, workspace_root, process_events.clone()) {
+                Ok(process) => {
+                    let process_id = process.id().to_owned();
+                    processes.push(process);
+                    (
+                        ResponseMessage::success(
+                            message.id,
+                            ResponseResult::ProcessStarted {
+                                id: process_id.clone(),
+                            },
+                        ),
+                        Some(process_id),
+                    )
+                }
+                Err(error) => (
+                    ResponseMessage::error(Some(message.id), INVALID_PARAMS, error.to_string()),
+                    None,
+                ),
+            }
+        }
+        Request::StopProcess { id } => {
+            let Some(index) = processes.iter().position(|process| process.id() == id) else {
+                return (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        INVALID_PARAMS,
+                        format!("process {id} is not running"),
+                    ),
+                    None,
+                );
+            };
+            match processes.swap_remove(index).stop() {
+                Ok(()) => (
+                    ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                    None,
+                ),
+                Err(error) => (
+                    ResponseMessage::error(
+                        Some(message.id),
+                        CAPABILITY_UNAVAILABLE,
+                        error.to_string(),
+                    ),
+                    None,
+                ),
+            }
+        }
+        Request::GetParameters { .. } | Request::SetParameter { .. } => (
             ResponseMessage::error(
                 Some(message.id),
                 CAPABILITY_UNAVAILABLE,
-                "launch and parameters are not available yet",
-            )
+                "parameters are not available yet",
+            ),
+            None,
+        ),
+    }
+}
+
+fn reap_finished_processes(processes: &mut Vec<ProcessWorker>) -> anyhow::Result<()> {
+    let mut index = 0;
+    while index < processes.len() {
+        if processes[index].is_finished() {
+            processes.swap_remove(index).stop()?;
+        } else {
+            index += 1;
         }
+    }
+    Ok(())
+}
+
+fn stop_processes(processes: &mut Vec<ProcessWorker>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for process in processes.drain(..) {
+        if let Err(error) = process.stop()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

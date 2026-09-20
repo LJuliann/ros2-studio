@@ -15509,11 +15509,15 @@ name = "ros_studio_daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-lite 2.6.1",
+ "nix 0.30.1",
  "rclrs",
  "ros_studio_model",
  "ros_studio_protocol",
  "serde",
  "serde_json",
+ "smol",
+ "tempfile",
 ]
 
 [[package]]

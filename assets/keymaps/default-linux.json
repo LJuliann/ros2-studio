@@ -733,6 +733,13 @@
     },
   },
   {
+    "context": "Editor && ROSStudioSource",
+    "bindings": {
+      "shift-f10": "ros_studio::RunContext",
+      "alt-shift-f10": "ros_studio::ChooseRunTarget",
+    },
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {

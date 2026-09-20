@@ -9,3 +9,8 @@ name = "camera"
 path = "src/camera.rs"
 
 [workspace]
+
+[dependencies]
+anyhow = "1.0"
+rclrs = "0.7"
+ros-env = "=0.2.0"

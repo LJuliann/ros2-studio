@@ -8,6 +8,7 @@ use ros_studio_protocol::{
 };
 use serde_json::Value;
 
+mod process;
 pub mod runtime_graph;
 
 #[cfg(feature = "ros-runtime")]
@@ -54,6 +55,7 @@ fn handle_request(message: RequestMessage) -> ResponseMessage {
         }
         Request::StartRuntimeDiscovery {}
         | Request::Launch { .. }
+        | Request::StopProcess { .. }
         | Request::GetParameters { .. }
         | Request::SetParameter { .. } => ResponseMessage::error(
             Some(message.id),
@@ -85,6 +87,7 @@ pub(crate) fn malformed_request(line: &str, error: &serde_json::Error) -> Respon
             | "start_runtime_discovery"
             | "stop_runtime_discovery"
             | "launch"
+            | "stop_process"
             | "get_parameters"
             | "set_parameter"
     );
