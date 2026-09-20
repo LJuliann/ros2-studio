@@ -52,6 +52,9 @@ pub enum Request {
         command: Vec<String>,
         env: BTreeMap<String, String>,
     },
+    StopProcess {
+        id: String,
+    },
     GetParameters {
         node: String,
     },
@@ -157,6 +160,11 @@ pub enum Event {
         id: String,
         stream: OutputStream,
         text: String,
+    },
+    ProcessExited {
+        id: String,
+        success: bool,
+        code: Option<i32>,
     },
     Diagnostic {
         severity: DiagnosticSeverity,
@@ -268,6 +276,9 @@ mod tests {
                 command: vec!["ros2".to_owned(), "launch".to_owned()],
                 env: BTreeMap::from([("ROS_DOMAIN_ID".to_owned(), "7".to_owned())]),
             },
+            Request::StopProcess {
+                id: "process-42-1".to_owned(),
+            },
             Request::GetParameters {
                 node: "/camera".to_owned(),
             },
@@ -347,6 +358,29 @@ mod tests {
         assert!(!json.contains("\"id\":"));
         assert_eq!(decoded, event);
         decoded.validate()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn process_events_round_trip() -> anyhow::Result<()> {
+        let output = EventMessage::new(Event::ProcessOutput {
+            id: "process-42-1".to_owned(),
+            stream: OutputStream::Stderr,
+            text: "build failed\n".to_owned(),
+        });
+        let exited = EventMessage::new(Event::ProcessExited {
+            id: "process-42-1".to_owned(),
+            success: false,
+            code: Some(2),
+        });
+
+        for event in [output, exited] {
+            let json = serde_json::to_string(&event)?;
+            let decoded = serde_json::from_str::<EventMessage>(&json)?;
+            assert_eq!(decoded, event);
+            decoded.validate()?;
+        }
 
         Ok(())
     }

@@ -10,10 +10,10 @@ use std::{
 use anyhow::Context as _;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use gpui::{
-    App, Bounds, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
-    TaskExt, WeakEntity, Window, actions, anchored, canvas, deferred, point,
+    Action, App, Bounds, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    Task, TaskExt, WeakEntity, Window, actions, anchored, canvas, deferred, point,
 };
 use rope::Point as TextPoint;
 use ros_studio_model::{
@@ -21,9 +21,13 @@ use ros_studio_model::{
     design_live::{canonical_ros_type_name, reconcile_project},
 };
 use ros_studio_protocol::GraphPatch;
-use ui::{Button, ContextMenu, Headline, HeadlineSize, Label, LabelSize, Tooltip, prelude::*};
+use ui::{
+    Button, ButtonLike, ContextMenu, Headline, HeadlineSize, Label, LabelSize, PopoverMenu,
+    PopoverMenuHandle, SplitButton, Tooltip, prelude::*,
+};
 use workspace::{
-    Pane, StatusItemView, Workspace,
+    Pane, StatusItemView, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
+    dock::{DockPosition, Panel, PanelEvent},
     item::{Item, ItemEvent},
 };
 
@@ -58,6 +62,7 @@ const LEFT_COLUMN_X: f32 = 48.0;
 const RIGHT_COLUMN_X: f32 = 500.0;
 const LEFT_COLUMN_OFFSET_X: f32 = 52.0;
 const RIGHT_COLUMN_OFFSET_X: f32 = 48.0;
+const MAXIMUM_PROCESS_LOG_CHUNKS: usize = 256;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GraphEdge {
@@ -108,6 +113,15 @@ enum GraphMode {
     Both,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum InspectorView {
+    #[default]
+    Selection,
+    Packages,
+    Nodes,
+    Topics,
+}
+
 impl GraphMode {
     fn label(self) -> &'static str {
         match self {
@@ -123,6 +137,83 @@ enum RuntimeStatus {
     Connecting,
     Ready,
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessKind {
+    Build,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunTargetKind {
+    Node,
+    File,
+}
+
+impl ProcessKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Run => "Run",
+        }
+    }
+}
+
+#[derive(Default)]
+enum ProcessState {
+    #[default]
+    Idle,
+    Starting,
+    Running(String),
+    Stopping(String),
+    Exited {
+        success: bool,
+        code: Option<i32>,
+    },
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct ProcessLogChunk {
+    text: String,
+}
+
+#[derive(Default)]
+struct ProcessPanel {
+    label: String,
+    state: ProcessState,
+    output: Vec<ProcessLogChunk>,
+}
+
+impl ProcessPanel {
+    fn is_active(&self) -> bool {
+        matches!(
+            &self.state,
+            ProcessState::Starting | ProcessState::Running(_) | ProcessState::Stopping(_)
+        )
+    }
+
+    fn status_label(&self) -> Option<String> {
+        match &self.state {
+            ProcessState::Idle => None,
+            ProcessState::Starting => Some(format!("{} · STARTING", self.label)),
+            ProcessState::Running(_) => Some(format!("{} · RUNNING", self.label)),
+            ProcessState::Stopping(_) => Some(format!("{} · STOPPING", self.label)),
+            ProcessState::Exited { success: true, .. } => {
+                Some(format!("{} · FINISHED", self.label))
+            }
+            ProcessState::Exited {
+                success: false,
+                code,
+            } => Some(format!(
+                "{} · FAILED{}",
+                self.label,
+                code.map(|code| format!(" ({code})")).unwrap_or_default()
+            )),
+            ProcessState::Failed(error) => Some(format!("{} · {error}", self.label)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -203,11 +294,39 @@ actions!(
         /// Shows or closes the ROS 2 Studio graph.
         ToggleGraph,
         /// Creates a Rust ROS node in the open workspace.
-        CreateNode
+        CreateNode,
+        /// Builds the selected ROS node.
+        BuildNode,
+        /// Compiles the active source file.
+        BuildFile,
+        /// Builds the configured target for the active file.
+        BuildContext,
+        /// Runs the selected ROS node.
+        RunNode,
+        /// Runs the active source file.
+        RunFile,
+        /// Runs the ROS node matching the active file, or the file itself.
+        RunContext,
+        /// Chooses whether to run a matching ROS node or the active file.
+        ChooseRunTarget,
+        /// Stops the running ROS node.
+        StopNode,
+        /// Shows or closes ROS build and run output.
+        ToggleProcessPanel
     ]
 );
 
 pub fn init(cx: &mut App) {
+    cx.observe_new(|pane: &mut Pane, window, cx| {
+        if let Some(window) = window {
+            let controls = cx.new(|_| RosRunToolbar::new());
+            pane.toolbar().update(cx, |toolbar, cx| {
+                toolbar.add_item(controls, window, cx);
+            });
+        }
+    })
+    .detach();
+
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
             open_graph(workspace, window, cx);
@@ -218,8 +337,43 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &CreateNode, window, cx| {
             open_node_wizard(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &BuildNode, window, cx| {
+            set_active_run_target(workspace, RunTargetKind::Node, cx);
+            start_workspace_process(workspace, ProcessKind::Build, window, cx);
+        });
+        workspace.register_action(|workspace, _: &BuildFile, window, cx| {
+            set_active_run_target(workspace, RunTargetKind::File, cx);
+            start_active_file_process(workspace, ProcessKind::Build, window, cx);
+        });
+        workspace.register_action(|workspace, _: &BuildContext, window, cx| {
+            start_build_context_process(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &RunNode, window, cx| {
+            set_active_run_target(workspace, RunTargetKind::Node, cx);
+            start_workspace_process(workspace, ProcessKind::Run, window, cx);
+        });
+        workspace.register_action(|workspace, _: &RunFile, window, cx| {
+            set_active_run_target(workspace, RunTargetKind::File, cx);
+            start_active_file_process(workspace, ProcessKind::Run, window, cx);
+        });
+        workspace.register_action(|workspace, _: &RunContext, window, cx| {
+            start_context_process(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ChooseRunTarget, window, cx| {
+            show_run_target_menu(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &StopNode, window, cx| {
+            stop_workspace_process(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleProcessPanel, window, cx| {
+            if !workspace.toggle_panel_focus::<RosProcessPanel>(window, cx) {
+                workspace.close_panel::<RosProcessPanel>(window, cx);
+            }
+        });
 
         if let Some(window) = window {
+            let process_panel = cx.new(|cx| RosProcessPanel::new(cx));
+            workspace.add_panel(process_panel, window, cx);
             let status_button = cx.new(|_| RosGraphStatusButton::new());
             workspace.status_bar().update(cx, |status_bar, cx| {
                 status_bar.add_left_item(status_button, window, cx);
@@ -250,8 +404,141 @@ fn open_graph(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<W
         .next()
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
     let project = workspace.project().clone();
-    let graph = cx.new(|cx| RosGraph::new(workspace_handle, workspace_root, project, cx));
+    let graph = cx.new(|cx| RosGraph::new(workspace_handle, workspace_root, project, window, cx));
+    if let Some(process_panel) = workspace.panel::<RosProcessPanel>(cx) {
+        process_panel.update(cx, |panel, cx| panel.set_graph(graph.clone(), cx));
+    }
     workspace.add_item_to_active_pane(Box::new(graph), None, true, window, cx);
+}
+
+fn start_workspace_process(
+    workspace: &mut Workspace,
+    kind: ProcessKind,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.reveal_panel::<RosProcessPanel>(window, cx);
+    if let Some((_, graph)) = graph_item(workspace, cx) {
+        let active_source_path = active_source_path(workspace, cx);
+        graph.update(cx, |graph, cx| {
+            if let Some(active_source_path) = active_source_path.as_deref() {
+                graph.select_node_for_source(active_source_path);
+            }
+            graph.start_selected_process(kind, cx);
+        });
+    }
+}
+
+fn start_active_file_process(
+    workspace: &mut Workspace,
+    kind: ProcessKind,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.reveal_panel::<RosProcessPanel>(window, cx);
+    let active_source_path = active_source_path(workspace, cx);
+    if let (Some(active_source_path), Some((_, graph))) =
+        (active_source_path, graph_item(workspace, cx))
+    {
+        graph.update(cx, |graph, cx| {
+            graph.start_source_file_process(&active_source_path, kind, cx);
+        });
+    }
+}
+
+fn start_context_process(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match active_run_target(workspace, cx) {
+        Some(RunTargetKind::Node) => {
+            start_workspace_process(workspace, ProcessKind::Run, window, cx)
+        }
+        Some(RunTargetKind::File) => {
+            start_active_file_process(workspace, ProcessKind::Run, window, cx)
+        }
+        None => show_run_target_menu(workspace, window, cx),
+    }
+}
+
+fn start_build_context_process(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match active_run_target(workspace, cx) {
+        Some(RunTargetKind::Node) => {
+            start_workspace_process(workspace, ProcessKind::Build, window, cx)
+        }
+        Some(RunTargetKind::File) => {
+            start_active_file_process(workspace, ProcessKind::Build, window, cx)
+        }
+        None => show_build_target_menu(workspace, window, cx),
+    }
+}
+
+fn active_source_path(workspace: &Workspace, cx: &App) -> Option<String> {
+    let path = workspace.active_item(cx)?.project_path(cx)?.path;
+    let path = path.as_unix_str();
+    is_supported_source_path(path).then(|| path.to_owned())
+}
+
+fn show_run_target_menu(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(controls) = active_run_toolbar(workspace, cx) {
+        let menu_handle = controls.read(cx).run_menu_handle.clone();
+        menu_handle.show(window, cx);
+    }
+}
+
+fn show_build_target_menu(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(controls) = active_run_toolbar(workspace, cx) {
+        let menu_handle = controls.read(cx).build_menu_handle.clone();
+        menu_handle.show(window, cx);
+    }
+}
+
+fn active_run_toolbar(workspace: &Workspace, cx: &App) -> Option<Entity<RosRunToolbar>> {
+    let toolbar = workspace.active_pane().read(cx).toolbar().clone();
+    toolbar.read(cx).item_of_type::<RosRunToolbar>()
+}
+
+fn active_run_target(workspace: &Workspace, cx: &App) -> Option<RunTargetKind> {
+    let controls = active_run_toolbar(workspace, cx)?;
+    controls.read(cx).active_run_target()
+}
+
+fn set_active_run_target(
+    workspace: &Workspace,
+    target: RunTargetKind,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(controls) = active_run_toolbar(workspace, cx) {
+        controls.update(cx, |controls, cx| {
+            controls.set_active_run_target(target);
+            cx.notify();
+        });
+    }
+}
+
+fn is_supported_source_path(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("rs" | "c" | "cc" | "cpp" | "cxx" | "py")
+    )
+}
+
+fn stop_workspace_process(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.reveal_panel::<RosProcessPanel>(window, cx);
+    if let Some((_, graph)) = graph_item(workspace, cx) {
+        graph.update(cx, RosGraph::stop_selected_process);
+    }
 }
 
 fn toggle_graph(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -311,6 +598,315 @@ impl Render for RosGraphStatusButton {
     }
 }
 
+struct RosRunToolbar {
+    active_source_path: Option<String>,
+    run_targets: BTreeMap<String, RunTargetKind>,
+    build_menu_handle: PopoverMenuHandle<ContextMenu>,
+    run_menu_handle: PopoverMenuHandle<ContextMenu>,
+}
+
+impl RosRunToolbar {
+    fn new() -> Self {
+        Self {
+            active_source_path: None,
+            run_targets: BTreeMap::new(),
+            build_menu_handle: PopoverMenuHandle::default(),
+            run_menu_handle: PopoverMenuHandle::default(),
+        }
+    }
+
+    fn active_run_target(&self) -> Option<RunTargetKind> {
+        self.active_source_path
+            .as_ref()
+            .and_then(|path| self.run_targets.get(path))
+            .copied()
+    }
+
+    fn set_active_run_target(&mut self, target: RunTargetKind) {
+        if let Some(path) = self.active_source_path.clone() {
+            self.run_targets.insert(path, target);
+        }
+    }
+}
+
+impl EventEmitter<ToolbarItemEvent> for RosRunToolbar {}
+
+impl ToolbarItemView for RosRunToolbar {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn workspace::ItemHandle>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        self.active_source_path = active_pane_item
+            .and_then(|item| item.project_path(cx))
+            .map(|path| path.path.as_unix_str().to_owned())
+            .filter(|path| is_supported_source_path(path));
+        if self.active_source_path.is_some() {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+
+    fn contribute_context(&self, context: &mut KeyContext, _: &App) {
+        if self.active_source_path.is_some() {
+            context.add("ROSStudioSource");
+        }
+    }
+}
+
+impl Render for RosRunToolbar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let build_menu_handle = self.build_menu_handle.clone();
+        let run_menu_handle = self.run_menu_handle.clone();
+        let (build_label, run_label) = match self.active_run_target() {
+            Some(RunTargetKind::Node) => ("Build node", "Run node"),
+            Some(RunTargetKind::File) => ("Build file", "Run file"),
+            None => ("Build", "Run"),
+        };
+        h_flex()
+            .gap_1()
+            .child(SplitButton::new(
+                ButtonLike::new("ros-toolbar-build")
+                    .child(Label::new(build_label).size(LabelSize::Small))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(BuildContext), cx);
+                    }),
+                PopoverMenu::new("ros-toolbar-build-menu")
+                    .anchor(gpui::Anchor::TopRight)
+                    .with_handle(build_menu_handle)
+                    .trigger(
+                        IconButton::new("ros-toolbar-build-menu-trigger", IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall),
+                    )
+                    .menu(|window, cx| {
+                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.entry(
+                                "Build matching ROS node",
+                                Some(Box::new(BuildNode)),
+                                |window, cx| {
+                                    window.dispatch_action(Box::new(BuildNode), cx);
+                                },
+                            )
+                            .entry(
+                                "Compile current file",
+                                Some(Box::new(BuildFile)),
+                                |window, cx| {
+                                    window.dispatch_action(Box::new(BuildFile), cx);
+                                },
+                            )
+                        }))
+                    })
+                    .into_any_element(),
+            ))
+            .child(SplitButton::new(
+                ButtonLike::new("ros-toolbar-run")
+                    .child(Label::new(run_label).size(LabelSize::Small))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(RunContext), cx);
+                    }),
+                PopoverMenu::new("ros-toolbar-run-menu")
+                    .anchor(gpui::Anchor::TopRight)
+                    .with_handle(run_menu_handle)
+                    .trigger(
+                        IconButton::new("ros-toolbar-run-menu-trigger", IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall),
+                    )
+                    .menu(|window, cx| {
+                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.entry(
+                                "Run matching ROS node",
+                                Some(Box::new(RunNode)),
+                                |window, cx| {
+                                    window.dispatch_action(Box::new(RunNode), cx);
+                                },
+                            )
+                            .entry(
+                                "Run current file",
+                                Some(Box::new(RunFile)),
+                                |window, cx| {
+                                    window.dispatch_action(Box::new(RunFile), cx);
+                                },
+                            )
+                        }))
+                    })
+                    .into_any_element(),
+            ))
+            .child(
+                Button::new("ros-toolbar-stop", "Stop").on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(StopNode), cx);
+                }),
+            )
+            .child(
+                Button::new("ros-toolbar-output", "Output").on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(ToggleProcessPanel), cx);
+                }),
+            )
+    }
+}
+
+struct RosProcessPanel {
+    graph: Option<WeakEntity<RosGraph>>,
+    _graph_subscription: Option<Subscription>,
+    focus_handle: FocusHandle,
+}
+
+impl RosProcessPanel {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            graph: None,
+            _graph_subscription: None,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn set_graph(&mut self, graph: Entity<RosGraph>, cx: &mut Context<Self>) {
+        self._graph_subscription = Some(cx.observe(&graph, |_, _, cx| cx.notify()));
+        self.graph = Some(graph.downgrade());
+        cx.notify();
+    }
+}
+
+impl EventEmitter<PanelEvent> for RosProcessPanel {}
+
+impl Focusable for RosProcessPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Panel for RosProcessPanel {
+    fn persistent_name() -> &'static str {
+        "RosProcessPanel"
+    }
+
+    fn panel_key() -> &'static str {
+        "RosProcessPanel"
+    }
+
+    fn position(&self, _: &Window, _: &App) -> DockPosition {
+        DockPosition::Bottom
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        position == DockPosition::Bottom
+    }
+
+    fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn default_size(&self, _: &Window, _: &App) -> Pixels {
+        px(240.0)
+    }
+
+    fn min_size(&self, _: &Window, _: &App) -> Option<Pixels> {
+        Some(px(100.0))
+    }
+
+    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
+        Some(IconName::TerminalAlt)
+    }
+
+    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
+        Some("ROS Build and Run Output")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleProcessPanel)
+    }
+
+    fn activation_priority(&self) -> u32 {
+        8
+    }
+}
+
+impl Render for RosProcessPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let graph = self.graph.as_ref().and_then(WeakEntity::upgrade);
+        let (status, can_start, can_stop, log_editor) = graph
+            .as_ref()
+            .map(|graph| {
+                let graph = graph.read(cx);
+                let can_start = graph.project.as_ref().is_ok_and(|project| {
+                    ros_node_command(
+                        project,
+                        graph.selected_node_id.as_deref(),
+                        ProcessKind::Build,
+                    )
+                    .is_some()
+                }) && !graph.process_panel.is_active();
+                (
+                    graph.process_panel.status_label(),
+                    can_start,
+                    matches!(&graph.process_panel.state, ProcessState::Running(_)),
+                    Some(graph.process_log_editor.clone()),
+                )
+            })
+            .unwrap_or((None, false, false, None));
+
+        v_flex()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Label::new(status.unwrap_or_else(|| "ROS build and run output".to_owned()))
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("ros-process-panel-build", "Build")
+                                    .disabled(!can_start)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(BuildNode), cx);
+                                    }),
+                            )
+                            .child(
+                                Button::new("ros-process-panel-run", "Run")
+                                    .disabled(!can_start)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(RunNode), cx);
+                                    }),
+                            )
+                            .child(
+                                Button::new("ros-process-panel-stop", "Stop")
+                                    .disabled(!can_stop)
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(StopNode), cx);
+                                    }),
+                            )
+                            .child(
+                                Button::new("ros-process-panel-close", "Close").on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(PanelEvent::Close)),
+                                ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .when_some(log_editor, |output, editor| output.child(editor))
+                    .when(graph.is_none(), |output| {
+                        output.items_center().justify_center().child(
+                            Label::new("Open ROS Graph and select a Rust node to build or run.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+    }
+}
+
 impl StatusItemView for RosGraphStatusButton {
     fn set_active_pane_item(
         &mut self,
@@ -335,12 +931,17 @@ pub struct RosGraph {
     project: Result<Project, SharedString>,
     displayed_project: Result<Project, SharedString>,
     graph_mode: GraphMode,
+    auto_follow_process: bool,
     runtime_status: RuntimeStatus,
     runtime_diagnostic: Option<String>,
     runtime_overlay: RuntimeOverlay,
+    runtime_commands: Option<async_channel::Sender<runtime_client::RuntimeCommand>>,
+    process_panel: ProcessPanel,
+    process_log_editor: Entity<Editor>,
     is_scanning: bool,
     node_layouts: Vec<GraphNodeLayout>,
     selected_node_id: Option<String>,
+    inspector_view: InspectorView,
     node_drag: Option<GraphNodeDrag>,
     canvas_pan: Option<GraphCanvasPan>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
@@ -359,9 +960,21 @@ impl RosGraph {
         workspace: WeakEntity<Workspace>,
         workspace_root: Option<PathBuf>,
         project: Entity<project::Project>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscriptions = vec![cx.subscribe(&project, Self::handle_project_event)];
+        let process_log_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_read_only(true);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_line_numbers(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_autoindent(false);
+            editor.set_input_enabled(false);
+            editor
+        });
 
         let mut graph = Self {
             workspace,
@@ -369,12 +982,17 @@ impl RosGraph {
             project: Err("Scanning ROS workspace…".into()),
             displayed_project: Err("Scanning ROS workspace…".into()),
             graph_mode: GraphMode::Design,
+            auto_follow_process: true,
             runtime_status: RuntimeStatus::NotStarted,
             runtime_diagnostic: None,
             runtime_overlay: RuntimeOverlay::default(),
+            runtime_commands: None,
+            process_panel: ProcessPanel::default(),
+            process_log_editor,
             is_scanning: true,
             node_layouts: Vec::new(),
             selected_node_id: None,
+            inspector_view: InspectorView::Selection,
             node_drag: None,
             canvas_pan: None,
             context_menu: None,
@@ -497,6 +1115,9 @@ impl RosGraph {
     }
 
     fn start_runtime_discovery(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_commands.is_some() {
+            return;
+        }
         let Some(workspace_root) = self.workspace_root.clone() else {
             self.runtime_status = RuntimeStatus::Failed("No local workspace is open".to_owned());
             return;
@@ -507,17 +1128,18 @@ impl RosGraph {
         self.runtime_status = RuntimeStatus::Connecting;
         self.refresh_display();
         let (sender, receiver) = async_channel::unbounded();
-        let process_task =
-            cx.background_spawn(
-                async move { runtime_client::discover(workspace_root, sender).await },
-            );
+        let (command_sender, command_receiver) = async_channel::unbounded();
+        self.runtime_commands = Some(command_sender);
+        let process_task = cx.background_spawn(async move {
+            runtime_client::connect(workspace_root, sender, command_receiver).await
+        });
         self._runtime_task = cx.spawn(async move |this, cx| {
             while let Ok(message) = receiver.recv().await {
                 let Some(graph) = this.upgrade() else {
                     return;
                 };
                 graph.update(cx, |graph, cx| {
-                    graph.handle_runtime_message(message);
+                    graph.handle_runtime_message(message, cx);
                     cx.notify();
                 });
             }
@@ -526,10 +1148,15 @@ impl RosGraph {
             if let Some(graph) = this.upgrade() {
                 graph.update(cx, |graph, cx| {
                     graph.runtime_overlay = RuntimeOverlay::default();
+                    graph.runtime_commands = None;
                     graph.runtime_status = RuntimeStatus::Failed(match result {
                         Ok(()) => "ROS 2 daemon disconnected".to_owned(),
                         Err(error) => format!("{error:#}"),
                     });
+                    if graph.process_panel.is_active() {
+                        graph.process_panel.state =
+                            ProcessState::Failed("daemon disconnected".to_owned());
+                    }
                     graph.refresh_display();
                     cx.notify();
                 });
@@ -537,7 +1164,7 @@ impl RosGraph {
         });
     }
 
-    fn handle_runtime_message(&mut self, message: RuntimeMessage) {
+    fn handle_runtime_message(&mut self, message: RuntimeMessage, cx: &mut Context<Self>) {
         match message {
             RuntimeMessage::GraphPatch(patch) => {
                 let Some(project_id) = self.project.as_ref().ok().map(|project| project.id.clone())
@@ -553,7 +1180,175 @@ impl RosGraph {
             RuntimeMessage::Diagnostic(message) => {
                 self.runtime_diagnostic = Some(message);
             }
+            RuntimeMessage::ProcessStarted(id) => {
+                if matches!(self.process_panel.state, ProcessState::Starting) {
+                    self.process_panel.state = ProcessState::Running(id);
+                }
+            }
+            RuntimeMessage::ProcessOutput { id, text } => {
+                let is_current_process = matches!(
+                    &self.process_panel.state,
+                    ProcessState::Running(process_id) | ProcessState::Stopping(process_id)
+                        if process_id == &id
+                );
+                if is_current_process {
+                    self.process_panel.output.push(ProcessLogChunk { text });
+                    if self.process_panel.output.len() > MAXIMUM_PROCESS_LOG_CHUNKS {
+                        self.process_panel.output.remove(0);
+                    }
+                    self.sync_process_log_editor(cx);
+                }
+            }
+            RuntimeMessage::ProcessExited { id, success, code } => {
+                let is_current_process = matches!(
+                    &self.process_panel.state,
+                    ProcessState::Running(process_id) | ProcessState::Stopping(process_id)
+                        if process_id == &id
+                );
+                if is_current_process {
+                    self.process_panel.state = ProcessState::Exited { success, code };
+                }
+            }
+            RuntimeMessage::RequestFailed(message) => {
+                if self.process_panel.is_active() {
+                    self.process_panel.state = ProcessState::Failed(message);
+                } else {
+                    self.runtime_diagnostic = Some(message);
+                }
+            }
         }
+    }
+
+    fn sync_process_log_editor(&self, cx: &mut Context<Self>) {
+        let text = self
+            .process_panel
+            .output
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        self.process_log_editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).as_singleton();
+            if let Some(buffer) = buffer {
+                buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+            }
+        });
+    }
+
+    fn start_selected_process(&mut self, kind: ProcessKind, cx: &mut Context<Self>) {
+        if self.process_panel.is_active() {
+            return;
+        }
+        let Ok(project) = &self.project else {
+            return;
+        };
+        let Some((command, target)) =
+            ros_node_command(project, self.selected_node_id.as_deref(), kind)
+        else {
+            self.process_panel.label = kind.label().to_owned();
+            self.process_panel.state = ProcessState::Failed("select a ROS node first".to_owned());
+            cx.notify();
+            return;
+        };
+
+        self.start_process(command, target, kind, cx);
+    }
+
+    fn select_node_for_source(&mut self, source_path: &str) -> bool {
+        let Ok(project) = &self.project else {
+            return false;
+        };
+        let Some(node) = project.nodes.iter().find(|node| {
+            node.source_locations
+                .iter()
+                .any(|location| location.path == source_path)
+        }) else {
+            return false;
+        };
+        self.selected_node_id = Some(node.id.as_str().to_owned());
+        self.inspector_view = InspectorView::Selection;
+        true
+    }
+
+    fn start_source_file_process(
+        &mut self,
+        source_path: &str,
+        kind: ProcessKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.process_panel.is_active() {
+            return;
+        }
+        let project = self.project.as_ref().ok();
+        let Some((command, target)) = source_file_command(project, source_path, kind) else {
+            self.process_panel.label = kind.label().to_owned();
+            self.process_panel.state =
+                ProcessState::Failed("the active file cannot be built or run".to_owned());
+            cx.notify();
+            return;
+        };
+
+        self.start_process(command, target, kind, cx);
+    }
+
+    fn start_process(
+        &mut self,
+        command: Vec<String>,
+        target: String,
+        kind: ProcessKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_runtime_discovery(cx);
+        let Some(sender) = &self.runtime_commands else {
+            self.process_panel.label = format!("{} {target}", kind.label());
+            self.process_panel.state = ProcessState::Failed("daemon unavailable".to_owned());
+            cx.notify();
+            return;
+        };
+        match sender.try_send(runtime_client::RuntimeCommand::Launch {
+            command,
+            env: BTreeMap::new(),
+        }) {
+            Ok(()) => {
+                self.process_panel = ProcessPanel {
+                    label: format!("{} {target}", kind.label()),
+                    state: ProcessState::Starting,
+                    output: Vec::new(),
+                };
+                self.sync_process_log_editor(cx);
+                if kind == ProcessKind::Run && self.auto_follow_process {
+                    self.set_graph_mode(GraphMode::Live, cx);
+                }
+            }
+            Err(error) => {
+                self.process_panel.label = format!("{} {target}", kind.label());
+                self.process_panel.state = ProcessState::Failed(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn stop_selected_process(&mut self, cx: &mut Context<Self>) {
+        let process_id = match &self.process_panel.state {
+            ProcessState::Running(id) => id.clone(),
+            _ => return,
+        };
+        let Some(sender) = &self.runtime_commands else {
+            self.process_panel.state = ProcessState::Failed("daemon unavailable".to_owned());
+            cx.notify();
+            return;
+        };
+        match sender.try_send(runtime_client::RuntimeCommand::StopProcess {
+            id: process_id.clone(),
+        }) {
+            Ok(()) => {
+                self.process_panel.state = ProcessState::Stopping(process_id);
+                if self.auto_follow_process {
+                    self.set_graph_mode(GraphMode::Design, cx);
+                }
+            }
+            Err(error) => self.process_panel.state = ProcessState::Failed(error.to_string()),
+        }
+        cx.notify();
     }
 
     fn show_canvas_context_menu(
@@ -937,6 +1732,23 @@ fn topic_count(project: &Project) -> usize {
         .len()
 }
 
+fn project_topics(project: &Project) -> Vec<(String, String)> {
+    project
+        .nodes
+        .iter()
+        .flat_map(|node| &node.endpoints)
+        .filter(|endpoint| {
+            matches!(
+                endpoint.kind,
+                EndpointKind::Publisher | EndpointKind::Subscription
+            )
+        })
+        .map(|endpoint| (endpoint.name.clone(), endpoint.type_name.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
 fn graph_layout(project: &Project, edges: &[GraphEdge]) -> Vec<GraphNodeLayout> {
     let mut incoming_edge_counts = project
         .nodes
@@ -1173,10 +1985,190 @@ fn node_subtitle(package_name: &str, executable: &str) -> String {
     }
 }
 
+fn ros_node_command(
+    project: &Project,
+    selected_node_id: Option<&str>,
+    kind: ProcessKind,
+) -> Option<(Vec<String>, String)> {
+    let node = project
+        .nodes
+        .iter()
+        .find(|node| Some(node.id.as_str()) == selected_node_id)?;
+    if node.executable.is_empty() {
+        return None;
+    }
+    let package = project
+        .packages
+        .iter()
+        .find(|package| package.id == node.package_id)?;
+    let is_rust_node = node
+        .source_locations
+        .iter()
+        .any(|location| location.path.ends_with(".rs"));
+    let command = if is_rust_node {
+        let manifest_path = if package.path.is_empty() {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("{}/Cargo.toml", package.path.trim_end_matches('/'))
+        };
+        let cargo_action = match kind {
+            ProcessKind::Build => "check",
+            ProcessKind::Run => "run",
+        };
+        vec![
+            "cargo".to_owned(),
+            cargo_action.to_owned(),
+            "--manifest-path".to_owned(),
+            manifest_path,
+            "--bin".to_owned(),
+            node.executable.clone(),
+        ]
+    } else {
+        match kind {
+            ProcessKind::Build => vec![
+                "colcon".to_owned(),
+                "build".to_owned(),
+                "--packages-select".to_owned(),
+                package.name.clone(),
+            ],
+            ProcessKind::Run => vec![
+                "bash".to_owned(),
+                "-lc".to_owned(),
+                "colcon build --packages-select \"$1\" && . install/setup.bash && exec ros2 run \"$1\" \"$2\""
+                    .to_owned(),
+                "ros-studio".to_owned(),
+                package.name.clone(),
+                node.executable.clone(),
+            ],
+        }
+    };
+
+    Some((command, node.logical_name.clone()))
+}
+
+fn source_file_command(
+    project: Option<&Project>,
+    source_path: &str,
+    kind: ProcessKind,
+) -> Option<(Vec<String>, String)> {
+    let path = std::path::Path::new(source_path);
+    let extension = path.extension()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?.to_owned();
+    let file_stem = path.file_stem()?.to_str()?;
+    let output_name = file_stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let output_path = format!("/tmp/ros-studio-{output_name}");
+
+    let command = match extension {
+        "py" => match kind {
+            ProcessKind::Build => vec![
+                "python3".to_owned(),
+                "-m".to_owned(),
+                "py_compile".to_owned(),
+                source_path.to_owned(),
+            ],
+            ProcessKind::Run => vec!["python3".to_owned(), source_path.to_owned()],
+        },
+        "c" | "cc" | "cpp" | "cxx" => {
+            let compiler = if extension == "c" { "cc" } else { "c++" };
+            match kind {
+                ProcessKind::Build => vec![
+                    compiler.to_owned(),
+                    "-fsyntax-only".to_owned(),
+                    source_path.to_owned(),
+                ],
+                ProcessKind::Run => vec![
+                    "bash".to_owned(),
+                    "-lc".to_owned(),
+                    "\"$1\" \"$2\" -o \"$3\" && exec \"$3\"".to_owned(),
+                    "ros-studio".to_owned(),
+                    compiler.to_owned(),
+                    source_path.to_owned(),
+                    output_path,
+                ],
+            }
+        }
+        "rs" => {
+            let package = project.and_then(|project| {
+                project
+                    .packages
+                    .iter()
+                    .filter(|package| {
+                        package.path.is_empty()
+                            || source_path.starts_with(&format!("{}/", package.path))
+                    })
+                    .max_by_key(|package| package.path.len())
+            });
+            if let Some(package) = package {
+                let executable = project
+                    .and_then(|project| {
+                        project.nodes.iter().find(|node| {
+                            node.package_id == package.id
+                                && node
+                                    .source_locations
+                                    .iter()
+                                    .any(|location| location.path == source_path)
+                        })
+                    })
+                    .map(|node| node.executable.as_str())
+                    .filter(|executable| !executable.is_empty())
+                    .unwrap_or(file_stem);
+                let manifest_path = if package.path.is_empty() {
+                    "Cargo.toml".to_owned()
+                } else {
+                    format!("{}/Cargo.toml", package.path.trim_end_matches('/'))
+                };
+                vec![
+                    "cargo".to_owned(),
+                    match kind {
+                        ProcessKind::Build => "check",
+                        ProcessKind::Run => "run",
+                    }
+                    .to_owned(),
+                    "--manifest-path".to_owned(),
+                    manifest_path,
+                    "--bin".to_owned(),
+                    executable.to_owned(),
+                ]
+            } else {
+                match kind {
+                    ProcessKind::Build => vec![
+                        "rustc".to_owned(),
+                        "--emit=metadata".to_owned(),
+                        source_path.to_owned(),
+                        "-o".to_owned(),
+                        output_path,
+                    ],
+                    ProcessKind::Run => vec![
+                        "bash".to_owned(),
+                        "-lc".to_owned(),
+                        "rustc \"$1\" -o \"$2\" && exec \"$2\"".to_owned(),
+                        "ros-studio".to_owned(),
+                        source_path.to_owned(),
+                        output_path,
+                    ],
+                }
+            }
+        }
+        _ => return None,
+    };
+
+    Some((command, file_name))
+}
+
 fn render_ros_inspector(
     project: &Project,
     selected_node_id: Option<&str>,
     mode: GraphMode,
+    inspector_view: InspectorView,
     cx: &mut Context<RosGraph>,
 ) -> Div {
     let panel = v_flex()
@@ -1200,6 +2192,68 @@ fn render_ros_inspector(
                         .color(Color::Accent),
                 ),
         );
+
+    match inspector_view {
+        InspectorView::Packages => {
+            return panel
+                .child(
+                    Label::new(format!("{} packages", project.packages.len()))
+                        .size(LabelSize::Small),
+                )
+                .children(project.packages.iter().map(|package| {
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .rounded_sm()
+                        .child(Label::new(package.name.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(package.path.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                }));
+        }
+        InspectorView::Nodes => {
+            return panel
+                .child(Label::new(format!("{} nodes", project.nodes.len())).size(LabelSize::Small))
+                .children(project.nodes.iter().enumerate().map(|(index, node)| {
+                    let node_id = node.id.as_str().to_owned();
+                    Button::new(
+                        ("ros-inspector-node-list-entry", index),
+                        node.logical_name.clone(),
+                    )
+                    .full_width()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected_node_id = Some(node_id.clone());
+                        this.inspector_view = InspectorView::Selection;
+                        cx.notify();
+                    }))
+                }));
+        }
+        InspectorView::Topics => {
+            let topics = project_topics(project);
+            return panel
+                .child(Label::new(format!("{} topics", topics.len())).size(LabelSize::Small))
+                .children(topics.into_iter().map(|(name, type_name)| {
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .rounded_sm()
+                        .child(Label::new(name).size(LabelSize::Small))
+                        .child(
+                            Label::new(type_name)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate_middle(),
+                        )
+                }));
+        }
+        InspectorView::Selection => {}
+    }
 
     let Some(node) = selected_node_id.and_then(|node_id| {
         project
@@ -1408,6 +2462,7 @@ impl Render for RosGraph {
             Ok(project) => {
                 let selected_node_id = self.selected_node_id.clone();
                 let graph_mode = self.graph_mode;
+                let auto_follow_process = self.auto_follow_process;
                 let runtime_hint = if graph_mode == GraphMode::Design {
                     None
                 } else {
@@ -1445,6 +2500,13 @@ impl Render for RosGraph {
                 let node_hover_background = cx.theme().colors().element_hover.opacity(0.55);
                 let port_color = cx.theme().colors().icon_accent;
                 let graph_entity = cx.entity();
+                let selected_rust_node =
+                    ros_node_command(project, selected_node_id.as_deref(), ProcessKind::Build)
+                        .is_some();
+                let process_is_active = self.process_panel.is_active();
+                let process_can_stop =
+                    matches!(&self.process_panel.state, ProcessState::Running(_));
+                let process_status = self.process_panel.status_label();
 
                 content
                     .child(
@@ -1484,15 +2546,61 @@ impl Render for RosGraph {
                                             }),
                                     )
                                     .child(
-                                        Label::new(format!(
-                                            "{} · {} packages · {} nodes · {} topics",
-                                            project.name,
-                                            project.packages.len(),
-                                            project.nodes.len(),
-                                            topic_count(project),
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Label::new(project.name.clone())
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Label::new("·")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "ros-graph-show-packages",
+                                                    format!("{} packages", project.packages.len()),
+                                                )
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.inspector_view = InspectorView::Packages;
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                Label::new("·")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "ros-graph-show-nodes",
+                                                    format!("{} nodes", project.nodes.len()),
+                                                )
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.inspector_view = InspectorView::Nodes;
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                Label::new("·")
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "ros-graph-show-topics",
+                                                    format!("{} topics", topic_count(project)),
+                                                )
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.inspector_view = InspectorView::Topics;
+                                                    cx.notify();
+                                                })),
+                                            ),
                                     )
                                     .when_some(runtime_hint, |header, hint| {
                                         header.child(
@@ -1511,6 +2619,51 @@ impl Render for RosGraph {
                                             .on_click(cx.listener(|_, _, window, cx| {
                                                 window.dispatch_action(Box::new(CreateNode), cx);
                                             })),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("ros-graph-build-node", "Build")
+                                                    .disabled(
+                                                        !selected_rust_node || process_is_active,
+                                                    )
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(BuildNode),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-run-node", "Run")
+                                                    .disabled(
+                                                        !selected_rust_node || process_is_active,
+                                                    )
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(Box::new(RunNode), cx);
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-stop-node", "Stop")
+                                                    .disabled(!process_can_stop)
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(StopNode),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("ros-graph-toggle-logs", "Logs")
+                                            .disabled(process_status.is_none())
+                                            .on_click(|_, window, cx| {
+                                                window.dispatch_action(
+                                                    Box::new(ToggleProcessPanel),
+                                                    cx,
+                                                );
+                                            }),
                                     )
                                     .child(
                                         h_flex()
@@ -1536,6 +2689,18 @@ impl Render for RosGraph {
                                                         this.set_graph_mode(GraphMode::Both, cx);
                                                     })),
                                             ),
+                                    )
+                                    .child(
+                                        Button::new("ros-graph-auto-follow-process", "Auto mode")
+                                            .toggle_state(auto_follow_process)
+                                            .tooltip(Tooltip::text(
+                                                "Switch to Live on Run and Design on Stop",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.auto_follow_process =
+                                                    !this.auto_follow_process;
+                                                cx.notify();
+                                            })),
                                     )
                                     .child(
                                         h_flex()
@@ -1883,6 +3048,8 @@ impl Render for RosGraph {
                                                             cx.stop_propagation();
                                                             this.selected_node_id =
                                                                 Some(node_id.clone());
+                                                            this.inspector_view =
+                                                                InspectorView::Selection;
                                                             if event.click_count() >= 2
                                                                 && let Some(source_location) =
                                                                     primary_source_location.clone()
@@ -1917,6 +3084,8 @@ impl Render for RosGraph {
                                                                 this.canvas_pan = None;
                                                                 this.selected_node_id =
                                                                     Some(node_id.clone());
+                                                                this.inspector_view =
+                                                                    InspectorView::Selection;
                                                                 this.node_drag =
                                                                     Some(GraphNodeDrag {
                                                                         node_id: node_id.clone(),
@@ -2088,6 +3257,7 @@ impl Render for RosGraph {
                                 project,
                                 selected_node_id.as_deref(),
                                 graph_mode,
+                                self.inspector_view,
                                 cx,
                             )),
                     )
@@ -2158,6 +3328,114 @@ mod tests {
                     type_name: "geometry_msgs::msg::Twist".to_owned(),
                 },
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn lists_fixture_topics_once() -> Result<(), serde_json::Error> {
+        let project = load_fixture_project()?;
+
+        assert_eq!(
+            project_topics(&project)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["/camera/image", "/cmd_vel", "/detections"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn builds_commands_for_rust_and_non_rust_nodes() -> anyhow::Result<()> {
+        let mut project = load_fixture_project()?;
+        let camera_id = "node:camera:src/camera/src/camera.rs:node";
+
+        assert_eq!(
+            ros_node_command(&project, Some(camera_id), ProcessKind::Build),
+            Some((
+                vec![
+                    "cargo".to_owned(),
+                    "check".to_owned(),
+                    "--manifest-path".to_owned(),
+                    "src/camera/Cargo.toml".to_owned(),
+                    "--bin".to_owned(),
+                    "camera".to_owned(),
+                ],
+                "camera".to_owned(),
+            ))
+        );
+        assert_eq!(
+            ros_node_command(&project, Some(camera_id), ProcessKind::Run),
+            Some((
+                vec![
+                    "cargo".to_owned(),
+                    "run".to_owned(),
+                    "--manifest-path".to_owned(),
+                    "src/camera/Cargo.toml".to_owned(),
+                    "--bin".to_owned(),
+                    "camera".to_owned(),
+                ],
+                "camera".to_owned(),
+            ))
+        );
+
+        let camera = project
+            .nodes
+            .iter_mut()
+            .find(|node| node.id.as_str() == camera_id)
+            .context("camera fixture node is missing")?;
+        camera.source_locations[0].path = "src/camera.py".to_owned();
+        assert_eq!(
+            ros_node_command(&project, Some(camera_id), ProcessKind::Run),
+            Some((
+                vec![
+                    "bash".to_owned(),
+                    "-lc".to_owned(),
+                    "colcon build --packages-select \"$1\" && . install/setup.bash && exec ros2 run \"$1\" \"$2\""
+                        .to_owned(),
+                    "ros-studio".to_owned(),
+                    "camera".to_owned(),
+                    "camera".to_owned(),
+                ],
+                "camera".to_owned(),
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn builds_commands_for_active_source_files() -> Result<(), serde_json::Error> {
+        let project = load_fixture_project()?;
+
+        assert_eq!(
+            source_file_command(Some(&project), "src/camera/src/camera.rs", ProcessKind::Run,),
+            Some((
+                vec![
+                    "cargo".to_owned(),
+                    "run".to_owned(),
+                    "--manifest-path".to_owned(),
+                    "src/camera/Cargo.toml".to_owned(),
+                    "--bin".to_owned(),
+                    "camera".to_owned(),
+                ],
+                "camera.rs".to_owned(),
+            ))
+        );
+        assert_eq!(
+            source_file_command(None, "scripts/teleop.py", ProcessKind::Build),
+            Some((
+                vec![
+                    "python3".to_owned(),
+                    "-m".to_owned(),
+                    "py_compile".to_owned(),
+                    "scripts/teleop.py".to_owned(),
+                ],
+                "teleop.py".to_owned(),
+            ))
         );
 
         Ok(())

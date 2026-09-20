@@ -12,6 +12,8 @@ use anyhow::{Context as _, bail, ensure};
 use ros_studio_model::{EndpointKind, EntityId, Project};
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
+const ROS_ENV_VERSION_REQUIREMENT: &str = "=0.2.0";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RclrsApi {
     V06,
@@ -436,18 +438,13 @@ pub fn preview_node_with_interfaces(
     if !interfaces.is_empty() {
         if let Some(ros_env_dependency) = dependencies.get("ros-env") {
             let version = dependency_version(ros_env_dependency)
-                .context("Existing ros-env dependency has no explicit version; typed pub/sub requires ros-env 0.2")?;
-            let version = version.trim().trim_start_matches(['^', '~', '=']).trim();
+                .context("Existing ros-env dependency has no explicit version; typed pub/sub requires ros-env =0.2.0")?;
             ensure!(
-                version == "0.2"
-                    || version
-                        .strip_prefix("0.2.")
-                        .is_some_and(|patch| !patch.is_empty()
-                            && patch.bytes().all(|byte| byte.is_ascii_digit())),
-                "Existing ros-env version {version} is incompatible with rclrs 0.7; expected 0.2"
+                version.trim() == ROS_ENV_VERSION_REQUIREMENT,
+                "Existing ros-env version {version} is incompatible with rclrs 0.7; expected {ROS_ENV_VERSION_REQUIREMENT}"
             );
         } else {
-            dependencies["ros-env"] = value("0.2");
+            dependencies["ros-env"] = value(ROS_ENV_VERSION_REQUIREMENT);
         }
     }
 
@@ -901,7 +898,7 @@ mod tests {
             ApiSelection::Auto,
             &interfaces,
         )?;
-        assert!(preview.manifest_after.contains("ros-env = \"0.2\""));
+        assert!(preview.manifest_after.contains("ros-env = \"=0.2.0\""));
         assert!(
             preview
                 .source
@@ -993,27 +990,31 @@ mod tests {
 
     #[test]
     fn refuses_incompatible_existing_ros_env_dependency() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let project = fixture_with_topics(root.path())?;
-        fs::write(
-            root.path().join("src/camera/Cargo.toml"),
-            "[package]\nname = \"camera\"\nversion = \"0.1.0\"\n[dependencies]\nrclrs = \"0.7\"\nros-env = \"0.1\"\n",
-        )?;
-        let selected = [NodeInterface {
-            kind: EndpointKind::Subscription,
-            name: "/camera/image".to_owned(),
-            type_name: "sensor_msgs::msg::Image".to_owned(),
-        }];
-        assert!(
-            preview_node_with_interfaces(
-                &project,
-                &project.packages[0].id,
-                "observer",
-                ApiSelection::Auto,
-                &selected,
-            )
-            .is_err()
-        );
+        for version in ["0.1", "0.2", "0.2.1"] {
+            let root = tempfile::tempdir()?;
+            let project = fixture_with_topics(root.path())?;
+            fs::write(
+                root.path().join("src/camera/Cargo.toml"),
+                format!(
+                    "[package]\nname = \"camera\"\nversion = \"0.1.0\"\n[dependencies]\nrclrs = \"0.7\"\nros-env = \"{version}\"\n"
+                ),
+            )?;
+            let selected = [NodeInterface {
+                kind: EndpointKind::Subscription,
+                name: "/camera/image".to_owned(),
+                type_name: "sensor_msgs::msg::Image".to_owned(),
+            }];
+            assert!(
+                preview_node_with_interfaces(
+                    &project,
+                    &project.packages[0].id,
+                    "observer",
+                    ApiSelection::Auto,
+                    &selected,
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 }
