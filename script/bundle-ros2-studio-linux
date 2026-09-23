@@ -26,7 +26,7 @@ if [[ ! -x "$daemon_binary" ]]; then
     exit 1
 fi
 
-./script/bundle-linux
+env -u SENTRY_AUTH_TOKEN ./script/bundle-linux
 
 zed_archive="${CARGO_TARGET_DIR:-target}/release/zed-linux-${architecture}.tar.gz"
 if [[ ! -f "$zed_archive" ]]; then
