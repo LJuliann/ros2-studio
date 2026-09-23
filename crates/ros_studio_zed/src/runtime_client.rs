@@ -1,12 +1,7 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use async_channel::{Receiver, Sender};
-use async_process::Command;
 use futures::{
     AsyncWrite, StreamExt as _,
     future::{self, Either},
@@ -16,6 +11,8 @@ use futures::{
 use ros_studio_protocol::{
     Event, EventMessage, GraphPatch, Request, RequestMessage, ResponseMessage, ResponseResult,
 };
+
+use crate::runtime_environment::detect_runtime;
 
 pub enum RuntimeCommand {
     Launch {
@@ -28,6 +25,8 @@ pub enum RuntimeCommand {
 }
 
 pub enum RuntimeMessage {
+    EnvironmentDetected(String),
+    EnvironmentOutput(String),
     GraphPatch(GraphPatch),
     Diagnostic(String),
     ProcessStarted(String),
@@ -48,8 +47,21 @@ pub async fn connect(
     sender: Sender<RuntimeMessage>,
     commands: Receiver<RuntimeCommand>,
 ) -> Result<()> {
-    let (mut command, daemon_workspace_root) = daemon_command(&workspace_root)?;
-    let mut child = command.spawn().context("failed to start ROS 2 daemon")?;
+    let launch = detect_runtime(&workspace_root)?;
+    let daemon_workspace_root = launch.workspace_root().to_owned();
+    sender
+        .send(RuntimeMessage::EnvironmentDetected(
+            launch.environment_label().to_owned(),
+        ))
+        .await?;
+    let preparation_sender = sender.clone();
+    let mut child = launch
+        .spawn(move |text| {
+            preparation_sender
+                .try_send(RuntimeMessage::EnvironmentOutput(text))
+                .context("ROS environment output receiver disconnected")
+        })
+        .await?;
     let mut stdin = child.stdin.take().context("ROS 2 daemon has no stdin")?;
     let stdout = child.stdout.take().context("ROS 2 daemon has no stdout")?;
 
@@ -140,72 +152,4 @@ async fn handle_daemon_line(line: &str, sender: &Sender<RuntimeMessage>) -> Resu
     }
 
     Ok(())
-}
-
-fn daemon_command(workspace_root: &Path) -> Result<(Command, String)> {
-    if let Some(path) = std::env::var_os("ROS_STUDIO_DAEMON_PATH") {
-        let mut command = Command::new(path);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        return Ok((command, workspace_root.to_string_lossy().into_owned()));
-    }
-
-    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .context("could not locate ROS 2 Studio repository")?
-        .to_path_buf();
-    let daemon_binary = repository_root.join("target/ros-humble/debug/ros-studio-daemon");
-    if !daemon_binary.is_file() {
-        bail!(
-            "ROS 2 daemon is missing at {}; build it in the ROS Humble container first",
-            daemon_binary.display()
-        );
-    }
-
-    let image = std::env::var("ROS_STUDIO_DOCKER_IMAGE")
-        .unwrap_or_else(|_| "rust-drone-ros2-humble:local".to_owned());
-    let workspace_name = workspace_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("open workspace has no valid UTF-8 directory name")?;
-    let daemon_workspace_root = format!("/workspace/{workspace_name}");
-    let mut command = Command::new("docker");
-    command
-        .args(["run", "--rm", "-i", "--network", "host", "--ipc", "host"])
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,src={},dst=/workspace/zed-fork,readonly",
-            repository_root.display()
-        ))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,src={},dst={daemon_workspace_root}",
-            workspace_root.display(),
-        ))
-        .arg("--workdir")
-        .arg(&daemon_workspace_root);
-    for variable in ["ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_LOCALHOST_ONLY"] {
-        if let Some(value) = std::env::var_os(variable) {
-            command
-                .arg("--env")
-                .arg(format!("{variable}={}", value.to_string_lossy()));
-        }
-    }
-    command
-        .arg(image)
-        .args([
-            "bash",
-            "-lc",
-            ". /opt/ros/humble/setup.bash && . /opt/ros2-rust-overlay/install/setup.bash && exec /workspace/zed-fork/target/ros-humble/debug/ros-studio-daemon",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-
-    Ok((command, daemon_workspace_root))
 }

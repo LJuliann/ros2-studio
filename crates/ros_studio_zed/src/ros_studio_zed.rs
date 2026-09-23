@@ -8,13 +8,14 @@ use std::{
 
 #[cfg(test)]
 use anyhow::Context as _;
-use editor::{Editor, SelectionEffects, scroll::Autoscroll};
+use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
 use gpui::{
     Action, App, Bounds, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
     Task, TaskExt, WeakEntity, Window, actions, anchored, canvas, deferred, point,
 };
+use multi_buffer::MultiBufferOffset;
 use rope::Point as TextPoint;
 use ros_studio_model::{
     Confidence, EndpointKind, EntityId, Node, Package, Project, RuntimeState, SourceLocation,
@@ -33,6 +34,7 @@ use workspace::{
 
 mod node_wizard;
 mod runtime_client;
+mod runtime_environment;
 
 use runtime_client::RuntimeMessage;
 
@@ -62,7 +64,7 @@ const LEFT_COLUMN_X: f32 = 48.0;
 const RIGHT_COLUMN_X: f32 = 500.0;
 const LEFT_COLUMN_OFFSET_X: f32 = 52.0;
 const RIGHT_COLUMN_OFFSET_X: f32 = 48.0;
-const MAXIMUM_PROCESS_LOG_CHUNKS: usize = 256;
+const MAXIMUM_PROCESS_LOG_CHUNKS: usize = 4096;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct GraphEdge {
@@ -739,6 +741,13 @@ impl Render for RosRunToolbar {
                 }),
             )
             .child(
+                Button::new("ros-toolbar-debug", "Debug…")
+                    .tooltip(Tooltip::text("Open Zed debugger configurations (DAP)"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(debugger_ui::Start), cx);
+                    }),
+            )
+            .child(
                 Button::new("ros-toolbar-output", "Output").on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(ToggleProcessPanel), cx);
                 }),
@@ -823,7 +832,7 @@ impl Panel for RosProcessPanel {
 impl Render for RosProcessPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let graph = self.graph.as_ref().and_then(WeakEntity::upgrade);
-        let (status, can_start, can_stop, log_editor) = graph
+        let (status, can_start, can_stop, log_editor, command_editor) = graph
             .as_ref()
             .map(|graph| {
                 let graph = graph.read(cx);
@@ -840,9 +849,11 @@ impl Render for RosProcessPanel {
                     can_start,
                     matches!(&graph.process_panel.state, ProcessState::Running(_)),
                     Some(graph.process_log_editor.clone()),
+                    Some(graph.process_command_editor.clone()),
                 )
             })
-            .unwrap_or((None, false, false, None));
+            .unwrap_or((None, false, false, None, None));
+        let graph_for_clear = graph.clone();
 
         v_flex()
             .size_full()
@@ -904,6 +915,28 @@ impl Render for RosProcessPanel {
                         )
                     }),
             )
+            .when_some(command_editor, |panel, command_editor| {
+                panel.child(
+                    h_flex()
+                        .flex_none()
+                        .h_9()
+                        .gap_2()
+                        .px_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(Label::new(">").size(LabelSize::Small).color(Color::Muted))
+                        .child(div().flex_1().h_7().child(command_editor))
+                        .child(
+                            Button::new("ros-process-panel-clear", "Clear output").on_click(
+                                move |_, _, cx| {
+                                    if let Some(graph) = &graph_for_clear {
+                                        graph.update(cx, |graph, cx| graph.clear_process_log(cx));
+                                    }
+                                },
+                            ),
+                        ),
+                )
+            })
     }
 }
 
@@ -933,11 +966,14 @@ pub struct RosGraph {
     graph_mode: GraphMode,
     auto_follow_process: bool,
     runtime_status: RuntimeStatus,
+    runtime_environment: Option<String>,
     runtime_diagnostic: Option<String>,
     runtime_overlay: RuntimeOverlay,
     runtime_commands: Option<async_channel::Sender<runtime_client::RuntimeCommand>>,
     process_panel: ProcessPanel,
     process_log_editor: Entity<Editor>,
+    process_command_editor: Entity<Editor>,
+    follow_process_output: bool,
     is_scanning: bool,
     node_layouts: Vec<GraphNodeLayout>,
     selected_node_id: Option<String>,
@@ -963,7 +999,7 @@ impl RosGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![cx.subscribe(&project, Self::handle_project_event)];
+        let mut subscriptions = vec![cx.subscribe(&project, Self::handle_project_event)];
         let process_log_editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
             editor.set_read_only(true);
@@ -975,6 +1011,57 @@ impl RosGraph {
             editor.set_input_enabled(false);
             editor
         });
+        let process_command_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Console command (try /clear)", window, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor
+        });
+        let graph_handle = cx.weak_entity();
+        subscriptions.push(process_command_editor.update(cx, |editor, _| {
+            editor.register_action(move |_: &editor::actions::Newline, window, cx| {
+                let graph_handle = graph_handle.clone();
+                window.defer(cx, move |window, cx| {
+                    if let Some(graph) = graph_handle.upgrade() {
+                        graph.update(cx, |graph, cx| {
+                            graph.submit_process_console_command(window, cx);
+                        });
+                    }
+                });
+            })
+        }));
+        subscriptions.push(cx.subscribe(
+            &process_log_editor,
+            |_, editor, event: &EditorEvent, cx| {
+                if matches!(
+                    event,
+                    EditorEvent::ScrollPositionChanged {
+                        local: true,
+                        autoscroll: false,
+                    }
+                ) {
+                    let graph_handle = cx.weak_entity();
+                    let editor = editor.clone();
+                    cx.defer(move |cx| {
+                        let is_at_bottom = editor.update(cx, |editor, cx| {
+                            let Some(visible_lines) = editor.visible_line_count() else {
+                                return true;
+                            };
+                            let scroll_top = editor.scroll_position(cx).y;
+                            let last_row = editor.max_point(cx).row().0 as f64;
+                            scroll_top + visible_lines + 1.0 >= last_row
+                        });
+                        if let Some(graph) = graph_handle.upgrade() {
+                            graph.update(cx, |graph, _| {
+                                graph.follow_process_output = is_at_bottom;
+                            });
+                        }
+                    });
+                }
+            },
+        ));
 
         let mut graph = Self {
             workspace,
@@ -984,11 +1071,14 @@ impl RosGraph {
             graph_mode: GraphMode::Design,
             auto_follow_process: true,
             runtime_status: RuntimeStatus::NotStarted,
+            runtime_environment: None,
             runtime_diagnostic: None,
             runtime_overlay: RuntimeOverlay::default(),
             runtime_commands: None,
             process_panel: ProcessPanel::default(),
             process_log_editor,
+            process_command_editor,
+            follow_process_output: true,
             is_scanning: true,
             node_layouts: Vec::new(),
             selected_node_id: None,
@@ -1124,6 +1214,7 @@ impl RosGraph {
         };
 
         self.runtime_overlay = RuntimeOverlay::default();
+        self.runtime_environment = None;
         self.runtime_diagnostic = None;
         self.runtime_status = RuntimeStatus::Connecting;
         self.refresh_display();
@@ -1166,6 +1257,13 @@ impl RosGraph {
 
     fn handle_runtime_message(&mut self, message: RuntimeMessage, cx: &mut Context<Self>) {
         match message {
+            RuntimeMessage::EnvironmentDetected(environment) => {
+                self.append_process_log(format!("ROS environment: {environment}\n"), cx);
+                self.runtime_environment = Some(environment);
+            }
+            RuntimeMessage::EnvironmentOutput(text) => {
+                self.append_process_log(text, cx);
+            }
             RuntimeMessage::GraphPatch(patch) => {
                 let Some(project_id) = self.project.as_ref().ok().map(|project| project.id.clone())
                 else {
@@ -1192,11 +1290,7 @@ impl RosGraph {
                         if process_id == &id
                 );
                 if is_current_process {
-                    self.process_panel.output.push(ProcessLogChunk { text });
-                    if self.process_panel.output.len() > MAXIMUM_PROCESS_LOG_CHUNKS {
-                        self.process_panel.output.remove(0);
-                    }
-                    self.sync_process_log_editor(cx);
+                    self.append_process_log(text, cx);
                 }
             }
             RuntimeMessage::ProcessExited { id, success, code } => {
@@ -1219,6 +1313,40 @@ impl RosGraph {
         }
     }
 
+    fn append_process_log(&mut self, text: String, cx: &mut Context<Self>) {
+        let appended_text = text.clone();
+        self.process_panel.output.push(ProcessLogChunk { text });
+        let excess = self
+            .process_panel
+            .output
+            .len()
+            .saturating_sub(MAXIMUM_PROCESS_LOG_CHUNKS);
+        let removed_length = self
+            .process_panel
+            .output
+            .drain(..excess)
+            .map(|chunk| chunk.text.len())
+            .sum::<usize>();
+        let follow_process_output = self.follow_process_output;
+        self.process_log_editor.update(cx, |editor, cx| {
+            editor.set_read_only(false);
+            if removed_length > 0 {
+                editor.edit(
+                    [(MultiBufferOffset(0)..MultiBufferOffset(removed_length), "")],
+                    cx,
+                );
+            }
+            let end = editor.buffer().read(cx).len(cx);
+            editor.edit([(end..end, appended_text)], cx);
+            editor.set_read_only(true);
+            if follow_process_output {
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let tail_anchor = buffer_snapshot.anchor_after(buffer_snapshot.len());
+                editor.request_autoscroll(Autoscroll::bottom().for_anchor(tail_anchor), cx);
+            }
+        });
+    }
+
     fn sync_process_log_editor(&self, cx: &mut Context<Self>) {
         let text = self
             .process_panel
@@ -1231,7 +1359,34 @@ impl RosGraph {
             if let Some(buffer) = buffer {
                 buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
             }
+            if self.follow_process_output {
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let tail_anchor = buffer_snapshot.anchor_after(buffer_snapshot.len());
+                editor.request_autoscroll(Autoscroll::bottom().for_anchor(tail_anchor), cx);
+            }
         });
+    }
+
+    fn clear_process_log(&mut self, cx: &mut Context<Self>) {
+        self.process_panel.output.clear();
+        self.follow_process_output = true;
+        self.sync_process_log_editor(cx);
+    }
+
+    fn submit_process_console_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self.process_command_editor.read(cx).text(cx);
+        self.process_command_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+
+        match command.trim() {
+            "/clear" | "clear" => self.clear_process_log(cx),
+            "" => {}
+            command => self.append_process_log(
+                format!("Unknown console command: {command}. Try /clear.\n"),
+                cx,
+            ),
+        }
     }
 
     fn start_selected_process(&mut self, kind: ProcessKind, cx: &mut Context<Self>) {
@@ -1314,6 +1469,7 @@ impl RosGraph {
                     state: ProcessState::Starting,
                     output: Vec::new(),
                 };
+                self.follow_process_output = true;
                 self.sync_process_log_editor(cx);
                 if kind == ProcessKind::Run && self.auto_follow_process {
                     self.set_graph_mode(GraphMode::Live, cx);
@@ -2537,6 +2693,16 @@ impl Render for RosGraph {
                                                     .color(Color::Muted),
                                                 )
                                             })
+                                            .when_some(
+                                                self.runtime_environment.clone(),
+                                                |header, environment| {
+                                                    header.child(
+                                                        Label::new(environment)
+                                                            .size(LabelSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    )
+                                                },
+                                            )
                                             .when(self.is_scanning, |header| {
                                                 header.child(
                                                     Label::new("SCANNING")
@@ -2650,6 +2816,18 @@ impl Render for RosGraph {
                                                     .on_click(|_, window, cx| {
                                                         window.dispatch_action(
                                                             Box::new(StopNode),
+                                                            cx,
+                                                        );
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("ros-graph-debug", "Debug…")
+                                                    .tooltip(Tooltip::text(
+                                                        "Open Zed debugger configurations (DAP)",
+                                                    ))
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(debugger_ui::Start),
                                                             cx,
                                                         );
                                                     }),

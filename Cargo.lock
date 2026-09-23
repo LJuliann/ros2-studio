@@ -15560,6 +15560,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-process",
+ "debugger_ui",
  "editor",
  "futures 0.3.34",
  "gpui",
@@ -15570,7 +15571,10 @@ dependencies = [
  "ros_studio_model",
  "ros_studio_protocol",
  "ros_studio_scan",
+ "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "ui",
  "workspace",
 ]
