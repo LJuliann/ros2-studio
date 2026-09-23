@@ -19,9 +19,10 @@ docker run --rm -i \
     --env "ROS_STUDIO_RUST_TOOLCHAIN=$rust_toolchain" \
     "$docker_image" \
     bash -lc '
-        set -euo pipefail
+        set -eo pipefail
         . /opt/ros/humble/setup.bash
         . /opt/ros2-rust-overlay/install/setup.bash
+        set -u
         rustup toolchain install "$ROS_STUDIO_RUST_TOOLCHAIN" --profile minimal
         CARGO_TARGET_DIR=target/ros-humble \
             cargo "+$ROS_STUDIO_RUST_TOOLCHAIN" build --release -j "$CARGO_BUILD_JOBS" \
