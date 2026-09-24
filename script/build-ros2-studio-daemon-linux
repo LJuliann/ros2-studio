@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repository_root"
+
+docker_image=${ROS_STUDIO_DOCKER_IMAGE:-rust-drone-ros2-humble:local}
+rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+if [[ -z "$rust_toolchain" ]]; then
+    echo "Could not read the Rust toolchain from rust-toolchain.toml" >&2
+    exit 1
+fi
+
+docker run --rm -i \
+    --mount "type=bind,src=$repository_root,dst=/workspace/zed-fork" \
+    --workdir /workspace/zed-fork \
+    --env "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}" \
+    --env "ROS_STUDIO_RUST_TOOLCHAIN=$rust_toolchain" \
+    "$docker_image" \
+    bash -lc '
+        set -eo pipefail
+        . /opt/ros/humble/setup.bash
+        . /opt/ros2-rust-overlay/install/setup.bash
+        set -u
+        rustup toolchain install "$ROS_STUDIO_RUST_TOOLCHAIN" --profile minimal
+        CARGO_TARGET_DIR=target/ros-humble \
+            cargo "+$ROS_STUDIO_RUST_TOOLCHAIN" build --release -j "$CARGO_BUILD_JOBS" \
+            -p ros_studio_daemon --features ros-runtime --bin ros-studio-daemon
+    '
+
+echo "Created target/ros-humble/release/ros-studio-daemon"

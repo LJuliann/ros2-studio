@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repository_root"
+
+architecture=$(uname -m)
+case "$architecture" in
+    x86_64|aarch64)
+        ;;
+    *)
+        echo "Unsupported Linux architecture: $architecture" >&2
+        exit 1
+        ;;
+esac
+
+daemon_binary=${ROS_STUDIO_DAEMON_BINARY:-target/ros-humble/release/ros-studio-daemon}
+if [[ ! -f "$daemon_binary" ]]; then
+    echo "ROS 2 Studio daemon not found at $daemon_binary" >&2
+    echo "Build its release binary in the ROS Humble container before bundling." >&2
+    exit 1
+fi
+if [[ ! -x "$daemon_binary" ]]; then
+    echo "ROS 2 Studio daemon is not executable: $daemon_binary" >&2
+    exit 1
+fi
+
+env -u SENTRY_AUTH_TOKEN ./script/bundle-linux
+
+zed_archive="${CARGO_TARGET_DIR:-target}/release/zed-linux-${architecture}.tar.gz"
+if [[ ! -f "$zed_archive" ]]; then
+    echo "Zed bundle was not created at $zed_archive" >&2
+    exit 1
+fi
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+tar -xzf "$zed_archive" -C "$temporary_directory"
+
+zed_application=$(find "$temporary_directory" -mindepth 1 -maxdepth 1 -type d -name 'zed*.app' -print -quit)
+if [[ -z "$zed_application" ]]; then
+    echo "The Zed archive does not contain an application directory" >&2
+    exit 1
+fi
+
+ros_studio_application="$temporary_directory/ros2-studio.app"
+mv "$zed_application" "$ros_studio_application"
+mv "$ros_studio_application/bin/zed" "$ros_studio_application/bin/ros2-studio"
+cp "$daemon_binary" "$ros_studio_application/libexec/ros-studio-daemon"
+chmod 755 "$ros_studio_application/bin/ros2-studio" \
+    "$ros_studio_application/libexec/zed-editor" \
+    "$ros_studio_application/libexec/ros-studio-daemon"
+
+for icon_size in 512x512 1024x1024; do
+    icon_directory="$ros_studio_application/share/icons/hicolor/$icon_size/apps"
+    if [[ -f "$icon_directory/zed.png" ]]; then
+        mv "$icon_directory/zed.png" "$icon_directory/ros2-studio.png"
+    fi
+done
+
+rm -f "$ros_studio_application/share/applications/"*.desktop
+export APP_NAME="ROS 2 Studio Alpha"
+export APP_CLI="ros2-studio"
+export APP_ICON="ros2-studio"
+export APP_ARGS="%U"
+export DO_STARTUP_NOTIFY="true"
+desktop_file="$ros_studio_application/share/applications/dev.ros2studio.ROS2Studio.desktop"
+envsubst < crates/zed/resources/zed.desktop.in > "$desktop_file"
+sed -i \
+    -e 's/GenericName=Text Editor/GenericName=ROS 2 IDE/' \
+    -e 's/Comment=A high-performance, multiplayer code editor./Comment=An integrated development environment for ROS 2./' \
+    -e 's/Keywords=zed;/Keywords=ros;ros2;robotics;/' \
+    "$desktop_file"
+chmod 755 "$desktop_file"
+
+cp docs/ros2-studio/alpha-release.md "$ros_studio_application/README-ROS2-STUDIO.md"
+
+output_directory="${CARGO_TARGET_DIR:-target}/release"
+archive_name="ros2-studio-linux-${architecture}.tar.gz"
+output_archive="$output_directory/$archive_name"
+checksum_file="$output_directory/$archive_name.sha256"
+rm -f "$output_archive" "$checksum_file"
+tar -czf "$output_archive" -C "$temporary_directory" "$(basename "$ros_studio_application")"
+(
+    cd "$output_directory"
+    sha256sum "$archive_name" > "$archive_name.sha256"
+)
+
+echo "Created $output_archive"
+echo "Created $checksum_file"

@@ -1,3 +1,16 @@
+# ROS 2 Studio (alpha)
+
+ROS 2 Studio is a Zed-based editor for exploring ROS 2 workspaces, inspecting
+design and live graphs, and building and running nodes. The first alpha targets
+Linux and ROS 2 Humble. It requires either a sourced ROS 2 installation on the
+host or a compatible Docker environment; it is not yet a standalone ROS 2
+installer.
+
+See the [alpha release guide](docs/ros2-studio/alpha-release.md) for build,
+installation, and runtime requirements.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
