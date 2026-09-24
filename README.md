@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # ROS 2 Studio (alpha)
 
 ROS 2 Studio is a Zed-based editor for exploring ROS 2 workspaces, inspecting
