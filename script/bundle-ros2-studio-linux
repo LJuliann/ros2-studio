@@ -71,6 +71,7 @@ sed -i \
     -e 's/GenericName=Text Editor/GenericName=ROS 2 IDE/' \
     -e 's/Comment=A high-performance, multiplayer code editor./Comment=An integrated development environment for ROS 2./' \
     -e 's/Keywords=zed;/Keywords=ros;ros2;robotics;/' \
+    -e 's/x-scheme-handler\/zed;//' \
     "$desktop_file"
 chmod 755 "$desktop_file"
 

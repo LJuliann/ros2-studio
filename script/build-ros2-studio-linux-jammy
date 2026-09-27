@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repository_root"
+
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    echo "This Ubuntu 22.04 build currently supports x86_64 only." >&2
+    exit 1
+fi
+if [[ "$(id -u)" -eq 0 ]]; then
+    echo "Run this script as your regular user, not root." >&2
+    exit 1
+fi
+if [[ ! -x target/ros-humble/release/ros-studio-daemon ]]; then
+    echo "Build the ROS Humble daemon first with ./script/build-ros2-studio-daemon-linux." >&2
+    exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is required to build against Ubuntu 22.04." >&2
+    exit 1
+fi
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "readelf is required to verify glibc compatibility." >&2
+    exit 1
+fi
+
+rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+if [[ -z "$rust_toolchain" ]]; then
+    echo "Could not read the Rust toolchain from rust-toolchain.toml." >&2
+    exit 1
+fi
+
+builder_image=${ROS_STUDIO_JAMMY_BUILDER_IMAGE:-ros2-studio-jammy-builder:local}
+docker build \
+    --file script/Dockerfile-ros2-studio-jammy \
+    --build-arg "BUILDER_UID=$(id -u)" \
+    --build-arg "BUILDER_GID=$(id -g)" \
+    --build-arg "RUST_TOOLCHAIN=$rust_toolchain" \
+    --tag "$builder_image" \
+    script
+
+mkdir -p target/ros2-studio-jammy
+build_log=target/ros2-studio-jammy/build.log
+if ! docker run --rm \
+    --mount "type=bind,src=$repository_root,dst=/workspace/zed-fork" \
+    --workdir /workspace/zed-fork \
+    --env "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}" \
+    --env CARGO_TARGET_DIR=target/ros2-studio-jammy \
+    "$builder_image" \
+    ./script/bundle-ros2-studio-linux 2>&1 | tee "$build_log"; then
+    echo "Build failed. Full output: $build_log" >&2
+    exit 1
+fi
+
+output_directory=target/ros2-studio-jammy/release
+archive_name=ros2-studio-linux-x86_64.tar.gz
+output_archive="$output_directory/$archive_name"
+if [[ ! -f "$output_archive" ]]; then
+    echo "The Ubuntu 22.04 build did not create $output_archive." >&2
+    exit 1
+fi
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+tar -xzf "$output_archive" -C "$temporary_directory"
+
+maximum_glibc=2.35
+incompatible=0
+checked=0
+while IFS= read -r -d '' file_path; do
+    if ! readelf --file-header "$file_path" >/dev/null 2>&1; then
+        continue
+    fi
+    checked=$((checked + 1))
+    required_glibc=$(
+        readelf --version-info "$file_path" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | cut -d_ -f2 \
+            | sort -Vu \
+            | tail -n 1 || true
+    )
+    if [[ -n "$required_glibc" ]] \
+        && [[ "$(printf '%s\n' "$maximum_glibc" "$required_glibc" | sort -V | tail -n 1)" != "$maximum_glibc" ]]; then
+        echo "Incompatible with Ubuntu 22.04: ${file_path#"$temporary_directory"/} needs glibc $required_glibc." >&2
+        incompatible=1
+    fi
+done < <(find "$temporary_directory/ros2-studio.app" -type f -print0)
+
+if [[ "$checked" -eq 0 || "$incompatible" -ne 0 ]]; then
+    echo "The archive did not pass the Ubuntu 22.04 compatibility check." >&2
+    exit 1
+fi
+
+(
+    cd "$output_directory"
+    sha256sum --check "$archive_name.sha256"
+)
+echo "Verified $checked ELF files against glibc $maximum_glibc."
+echo "Created $output_archive"

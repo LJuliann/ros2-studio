@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repository_root"
+
+release_version=${1:-}
+archive_path=${2:-target/ros2-studio-jammy/release/ros2-studio-linux-x86_64.tar.gz}
+
+if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+    echo "Usage: $0 <version, for example 0.1.0-alpha.2> [archive]" >&2
+    exit 1
+fi
+if [[ ! -f "$archive_path" ]]; then
+    echo "ROS 2 Studio archive not found: $archive_path" >&2
+    exit 1
+fi
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "dpkg-deb is required to build the Debian package." >&2
+    exit 1
+fi
+
+archive_path=$(realpath "$archive_path")
+output_directory=$(dirname "$archive_path")
+if tar -tzf "$archive_path" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    echo "The archive contains an unsafe path." >&2
+    exit 1
+fi
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+extraction_directory="$temporary_directory/extracted"
+package_root="$temporary_directory/package"
+mkdir -p "$extraction_directory" "$package_root"
+tar -xzf "$archive_path" -C "$extraction_directory"
+
+application_directory="$extraction_directory/ros2-studio.app"
+for required_path in \
+    bin/ros2-studio \
+    libexec/zed-editor \
+    libexec/ros-studio-daemon \
+    share/applications/dev.ros2studio.ROS2Studio.desktop; do
+    if [[ ! -e "$application_directory/$required_path" ]]; then
+        echo "The archive is missing ros2-studio.app/$required_path." >&2
+        exit 1
+    fi
+done
+
+install -d \
+    "$package_root/DEBIAN" \
+    "$package_root/opt/ros2-studio" \
+    "$package_root/usr/bin" \
+    "$package_root/usr/share/applications"
+cp -a "$application_directory/." "$package_root/opt/ros2-studio/"
+ln -s /opt/ros2-studio/bin/ros2-studio "$package_root/usr/bin/ros2-studio"
+
+desktop_file="$package_root/usr/share/applications/dev.ros2studio.ROS2Studio.desktop"
+install -m 644 \
+    "$application_directory/share/applications/dev.ros2studio.ROS2Studio.desktop" \
+    "$desktop_file"
+sed -i \
+    -e 's|^TryExec=.*|TryExec=/usr/bin/ros2-studio|' \
+    -e 's|^Exec=ros2-studio|Exec=/usr/bin/ros2-studio|' \
+    -e 's|x-scheme-handler/zed;||' \
+    "$desktop_file"
+
+for icon_size in 512x512 1024x1024; do
+    source_icon="$application_directory/share/icons/hicolor/$icon_size/apps/ros2-studio.png"
+    if [[ -f "$source_icon" ]]; then
+        install -Dm644 "$source_icon" \
+            "$package_root/usr/share/icons/hicolor/$icon_size/apps/ros2-studio.png"
+    fi
+done
+
+debian_version=${release_version/-alpha./~alpha.}-1
+installed_size=$(du -sk "$package_root/opt/ros2-studio" | cut -f1)
+printf '%s\n' \
+    'Package: ros2-studio' \
+    "Version: $debian_version" \
+    'Section: devel' \
+    'Priority: optional' \
+    'Architecture: amd64' \
+    'Maintainer: LJuliann <LJuliann@users.noreply.github.com>' \
+    'Depends: libc6 (>= 2.35), libasound2, libglib2.0-0' \
+    "Installed-Size: $installed_size" \
+    'Description: Integrated development environment for ROS 2' \
+    ' ROS 2 Studio provides design and live graph inspection, code generation,' \
+    ' and build and run workflows for ROS 2 projects.' \
+    > "$package_root/DEBIAN/control"
+
+package_name="ros2-studio-v${release_version}-linux-x86_64-ubuntu-22.04.deb"
+output_package="$output_directory/$package_name"
+checksum_file="$output_package.sha256"
+rm -f "$output_package" "$checksum_file"
+dpkg-deb --root-owner-group --build "$package_root" "$output_package"
+(
+    cd "$output_directory"
+    sha256sum "$package_name" > "$package_name.sha256"
+)
+dpkg-deb --info "$output_package" >/dev/null
+
+echo "Created $output_package"
+echo "Created $checksum_file"
