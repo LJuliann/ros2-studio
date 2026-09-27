@@ -35,6 +35,43 @@ target/release/ros2-studio-linux-<architecture>.tar.gz.sha256
 
 Set `ROS_STUDIO_DAEMON_BINARY` when the daemon was built at a different path.
 
+## Ubuntu 22.04 compatibility
+
+The first public alpha was bundled on Ubuntu 24.04 and its editor requires glibc 2.39. Repackaging that archive as a `.deb` does not make it work on Ubuntu 22.04, which provides glibc 2.35.
+
+To produce an Ubuntu 22.04-compatible release, first build the ROS Humble daemon as above. Then build the editor and archive inside the dedicated Ubuntu 22.04 container:
+
+```bash
+CARGO_BUILD_JOBS=1 ./script/build-ros2-studio-linux-jammy
+```
+
+This writes `target/ros2-studio-jammy/release/ros2-studio-linux-x86_64.tar.gz` and its `.sha256` file. The script checks every ELF file in the archive for glibc symbol requirements above 2.35 and fails if it finds one. A passing symbol check is not a substitute for launching the result on an actual Ubuntu 22.04 desktop before publishing it.
+
+Do not replace a published alpha archive with this build without also giving it a new release version and testing the new download.
+
+## Build the Debian package
+
+Create the installable package from the validated Ubuntu 22.04 archive without recompiling the editor:
+
+```bash
+./script/package-ros2-studio-deb 0.1.0-alpha.2
+```
+
+The script writes these additional release assets next to the archive:
+
+```text
+ros2-studio-v0.1.0-alpha.2-linux-x86_64-ubuntu-22.04.deb
+ros2-studio-v0.1.0-alpha.2-linux-x86_64-ubuntu-22.04.deb.sha256
+```
+
+Install or upgrade the package with APT:
+
+```bash
+sudo apt install ./ros2-studio-v0.1.0-alpha.2-linux-x86_64-ubuntu-22.04.deb
+```
+
+The package installs the application under `/opt/ros2-studio`, the command as `/usr/bin/ros2-studio`, and a desktop entry and icons under `/usr/share`. Remove it with `sudo apt remove ros2-studio`.
+
 ## Run the archive
 
 Verify and extract the archive:

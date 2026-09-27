@@ -1,0 +1,46 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILDER_UID=1000
+ARG BUILDER_GID=1000
+ARG RUST_TOOLCHAIN=1.98.1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid "$BUILDER_GID" builder \
+    && useradd --uid "$BUILDER_UID" --gid "$BUILDER_GID" --create-home builder
+
+ENV CARGO_HOME=/home/builder/.cargo
+ENV RUSTUP_HOME=/home/builder/.rustup
+ENV PATH=/home/builder/.cargo/bin:$PATH
+
+USER builder
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal
+
+USER root
+COPY linux /tmp/ros2-studio-build/linux
+COPY install-cmake /tmp/ros2-studio-build/install-cmake
+RUN bash /tmp/ros2-studio-build/linux \
+    && bash /tmp/ros2-studio-build/install-cmake 3.30.4
+
+# Jammy's default C++ compiler is GCC 11, which rejects a WebRTC header.
+# Use Clang 18 with Jammy's libstdc++ headers for the bundled C++ code.
+RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key \
+    && gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg /tmp/llvm-snapshot.gpg.key \
+    && echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+        > /etc/apt/sources.list.d/llvm-18.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang-18 \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm-snapshot.gpg.key
+
+ENV CC=clang-18
+ENV CXX=clang++-18
+
+USER builder
+RUN rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+    && rustup default "$RUST_TOOLCHAIN"
+
+WORKDIR /workspace/zed-fork
