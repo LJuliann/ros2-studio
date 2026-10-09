@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Export or package ROS 2 Studio without the Zed editor."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+FORBIDDEN = {"zed", "editor", "project", "workspace", "lsp", "ros_studio_zed", "ui", "livekit", "libwebrtc", "webrtc-sys"}
+
+
+def run(arguments, **kwargs):
+    return subprocess.run(arguments, check=True, text=True, **kwargs)
+
+
+def workspace_closure(metadata):
+    packages = {Path(package["manifest_path"]).parent: package for package in metadata["packages"]}
+    pending = [package for package in packages.values() if package["name"] in {"ros_studio_app", "ros_studio_daemon"}]
+    if len(pending) != 2:
+        raise ValueError("The workspace must contain ros_studio_app and ros_studio_daemon")
+    selected = {}
+    while pending:
+        package = pending.pop()
+        directory = Path(package["manifest_path"]).parent
+        if directory in selected:
+            continue
+        if package["name"] in FORBIDDEN:
+            raise ValueError(f"Editor dependency leaked into standalone export: {package['name']}")
+        selected[directory] = package
+        for dependency in package["dependencies"]:
+            if dependency.get("path"):
+                dependency_path = Path(dependency["path"])
+                if dependency_path not in packages:
+                    raise ValueError(f"Unknown local dependency: {dependency_path}")
+                pending.append(packages[dependency_path])
+    return selected
+
+
+def export_manifest(contents, members, dependencies=None):
+    sections = re.split(r"(?m)(?=^\[[^\n]+\]\s*$)", contents)
+    result = []
+    for section in sections:
+        heading = section.splitlines()[0] if section.splitlines() else ""
+        if heading == "[workspace]":
+            result.append('[workspace]\nresolver = "2"\nmembers = ' + json.dumps(sorted(members), indent=4) + '\ndefault-members = ["crates/ros_studio_app"]\n\n')
+        elif heading.startswith("[profile.") and ".package" in heading:
+            continue
+        elif heading.startswith("[workspace.metadata."):
+            continue
+        elif heading.startswith("[workspace.dependencies.") and dependencies is not None and heading[len("[workspace.dependencies."):-1] not in dependencies:
+            continue
+        else:
+            if heading == "[workspace.dependencies]" and dependencies is not None:
+                entries = re.split(r"(?m)(?=^[A-Za-z0-9_-]+\s*=)", section[len(heading):])
+                section = heading + "\n" + "".join(entry for entry in entries if re.match(r"^([A-Za-z0-9_-]+)\s*=", entry) and re.match(r"^([A-Za-z0-9_-]+)\s*=", entry).group(1) in dependencies)
+            lines = []
+            for line in section.splitlines(keepends=True):
+                path = re.search(r'path\s*=\s*"([^"]+)"', line)
+                if heading == "[workspace.dependencies]" and path and path.group(1) not in members:
+                    continue
+                if heading == "[patch.crates-io]" and re.match(r"(?:livekit|libwebrtc|webrtc-sys|scratch)\s*=", line):
+                    continue
+                lines.append(line)
+            result.append("".join(lines))
+    return "".join(result)
+
+
+def copy_tree(source, destination):
+    # Materialize shared repository licenses, but never copy links to machine-specific files.
+    for path in source.rglob("*"):
+        if path.is_symlink() and not path.resolve().is_relative_to(source.resolve()) and not path.resolve().is_relative_to(ROOT):
+            raise ValueError(f"External symbolic link in export: {path}")
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns("target", ".git", "__pycache__"), symlinks=False)
+
+
+def export_workspace(arguments):
+    requested = arguments.destination.expanduser()
+    if requested.exists() or requested.is_symlink():
+        raise ValueError("Choose a new destination; an existing folder is never overwritten")
+    destination = requested.resolve()
+    if destination.is_relative_to(ROOT):
+        raise ValueError("Export outside the original repository")
+    metadata = json.loads(run(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"], cwd=ROOT, capture_output=True).stdout)
+    selected = workspace_closure(metadata)
+    members = {str(path.relative_to(ROOT)) for path in selected}
+    dependencies = {dependency.get("rename") or dependency["name"] for package in selected.values() for dependency in package["dependencies"]}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ros2-studio-export-", dir=destination.parent) as temporary:
+        staging = Path(temporary) / "source"
+        staging.mkdir()
+        for directory in sorted(selected, key=lambda path: len(path.parts)):
+            target = staging / directory.relative_to(ROOT)
+            if not target.exists():
+                copy_tree(directory, target)
+        (staging / "Cargo.toml").write_text(export_manifest((ROOT / "Cargo.toml").read_text(), members, dependencies))
+        for name in ("Cargo.lock", "LICENSE-GPL", "LICENSE-APACHE", "clippy.toml", "typos.toml"):
+            if (ROOT / name).is_file():
+                shutil.copy2(ROOT / name, staging / name)
+        toolchain = (ROOT / "rust-toolchain.toml").read_text()
+        (staging / "rust-toolchain.toml").write_text(re.sub(r"(?ms)^targets\s*=\s*\[.*?^\]\s*", "", toolchain))
+        (staging / ".gitignore").write_text("/target/\n*.deb\n*.tar.gz\n*.sha256\n__pycache__/\n")
+        (staging / ".cargo").mkdir()
+        (staging / ".cargo/config.toml").write_text('[build]\njobs = 1\nrustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]\n')
+        # Scanner/codegen tests depend on the tracked fixture, not on user-generated nodes.
+        fixture_files = run(["git", "ls-files", "-z", "examples/drone_demo_ws"], cwd=ROOT, capture_output=True).stdout.split("\0")
+        for relative in filter(None, fixture_files):
+            source = ROOT / relative
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        if (ROOT / "assets/fonts").is_dir():
+            copy_tree(ROOT / "assets/fonts", staging / "assets/fonts")
+        (staging / "script").mkdir(exist_ok=True)
+        for name in ("ros2-studio-standalone", "clippy", "build-ros2-studio-daemon-linux"):
+            shutil.copy2(ROOT / "script" / name, staging / "script" / name)
+        copy_tree(ROOT / "script/licenses", staging / "script/licenses")
+        if (ROOT / "script/tests/test_ros2_studio_standalone.py").is_file():
+            (staging / "script/tests").mkdir()
+            shutil.copy2(ROOT / "script/tests/test_ros2_studio_standalone.py", staging / "script/tests/test_ros2_studio_standalone.py")
+        (staging / "README.md").write_text((ROOT / "crates/ros_studio_app/README.md").read_text())
+        (staging / "NOTICE.md").write_text(
+            "# Attribution\n\nROS 2 Studio uses GPUI and supporting crates developed by Zed Industries.\n"
+            "Their source headers and original licenses are retained. The Zed editor is not included.\n"
+            "See LICENSE-GPL and LICENSE-APACHE and each crate's Cargo.toml.\n"
+        )
+        run(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"], cwd=staging, stdout=subprocess.DEVNULL)
+        graph = run(["cargo", "tree", "--offline", "-p", "ros_studio_app", "--edges", "normal", "--prefix", "none", "--format", "{p}"], cwd=staging, capture_output=True).stdout
+        leaked = FORBIDDEN.intersection(line.split()[0] for line in graph.splitlines() if line.split())
+        if leaked:
+            raise ValueError(f"Forbidden runtime dependencies: {sorted(leaked)}")
+        if destination.exists():
+            raise ValueError("Export destination appeared while preparing the export; refusing overwrite")
+        staging.rename(destination)
+    print(f"Exported {len(selected)} local crates to {destination}; no Zed editor crates")
+
+
+def binary_info(path):
+    path = path.resolve(strict=True)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError(f"Not an executable: {path}")
+    with path.open("rb") as binary:
+        if binary.read(4) != b"\x7fELF":
+            raise ValueError(f"Not a Linux ELF binary: {path}")
+    header = run(["readelf", "-h", str(path)], capture_output=True).stdout
+    architecture = "amd64" if "Advanced Micro Devices X86-64" in header else "arm64" if "AArch64" in header else None
+    if architecture is None:
+        raise ValueError(f"Unsupported ELF architecture: {path}")
+    versions = run(["readelf", "--version-info", str(path)], capture_output=True).stdout
+    glibc = max((tuple(map(int, match.split("."))) for match in re.findall(r"\bGLIBC_([0-9.]+)\b", versions)), default=(0, 0))
+    return path, architecture, glibc
+
+
+def checksum(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    path.with_name(path.name + ".sha256").write_text(f"{digest.hexdigest()}  {path.name}\n")
+
+
+def package(arguments):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-alpha\.[0-9]+)?", arguments.version):
+        raise ValueError("Use a version such as 0.2.0-alpha.1 or 0.2.0")
+    app, architecture, app_glibc = binary_info(arguments.app_binary)
+    daemon, daemon_architecture, daemon_glibc = binary_info(arguments.daemon_binary)
+    if architecture != daemon_architecture:
+        raise ValueError("App and daemon architectures differ")
+    glibc = max(app_glibc, daemon_glibc)
+    if arguments.glibc_max and glibc > tuple(map(int, arguments.glibc_max.split("."))):
+        raise ValueError(f"Binaries require GLIBC {glibc}, newer than requested {arguments.glibc_max}; rebuild on the oldest supported distribution")
+    output = arguments.output.absolute()
+    output.mkdir(parents=True, exist_ok=True)
+    suffix = "x86_64" if architecture == "amd64" else "aarch64"
+    name = f"ros2-studio-v{arguments.version}-standalone-linux-{suffix}"
+    artifact = output / (name + (".deb" if arguments.command == "deb" else ".tar.gz"))
+    if artifact.exists() or artifact.is_symlink() or artifact.with_name(artifact.name + ".sha256").exists() or artifact.with_name(artifact.name + ".sha256").is_symlink():
+        raise ValueError(f"Artifact already exists; choose a new version or output directory: {artifact}")
+    with tempfile.TemporaryDirectory(prefix="ros2-studio-package-") as temporary:
+        root = Path(temporary)
+        application = root / "ros2-studio.app"
+        (application / "bin").mkdir(parents=True)
+        (application / "libexec").mkdir()
+        shutil.copy2(app, application / "bin/ros2-studio")
+        shutil.copy2(daemon, application / "libexec/ros-studio-daemon")
+        for binary in (application / "bin/ros2-studio", application / "libexec/ros-studio-daemon"):
+            binary.chmod(0o755)
+            if not arguments.keep_debug:
+                run(["strip", "--strip-debug", str(binary)])
+        shutil.copy2(ROOT / "crates/ros_studio_app/README.md", application / "README.md")
+        for license_name in ("LICENSE-GPL", "LICENSE-APACHE"):
+            shutil.copy2(ROOT / license_name, application / license_name)
+        if not arguments.licenses or not arguments.licenses.is_file():
+            raise ValueError("Provide --licenses with the generated third-party license notices for these binaries")
+        shutil.copy2(arguments.licenses, application / "THIRD-PARTY-LICENSES.md")
+        desktop = application / "share/applications/dev.ros2studio.Standalone.desktop"
+        desktop.parent.mkdir(parents=True)
+        desktop.write_text("[Desktop Entry]\nType=Application\nName=ROS 2 Studio\nGenericName=ROS Graph and Node Tools\nExec=ros2-studio %f\nTryExec=ros2-studio\nIcon=applications-development\nTerminal=false\nCategories=Development;\n")
+        (application / "BUILD-INFO.json").write_text(json.dumps({"version": arguments.version, "architecture": architecture, "minimum_glibc": ".".join(map(str, glibc)), "editor_embedded": False}, indent=2) + "\n")
+        if arguments.command == "bundle":
+            with tarfile.open(artifact, "w:gz") as archive:
+                archive.add(application, arcname="ros2-studio.app")
+        else:
+            package_root = root / "debian"
+            (package_root / "opt").mkdir(parents=True)
+            shutil.copytree(application, package_root / "opt/ros2-studio")
+            (package_root / "usr/bin").mkdir(parents=True)
+            (package_root / "usr/bin/ros2-studio").symlink_to("/opt/ros2-studio/bin/ros2-studio")
+            installed_desktop = package_root / "usr/share/applications/dev.ros2studio.Standalone.desktop"
+            installed_desktop.parent.mkdir(parents=True)
+            installed_desktop.write_text(desktop.read_text().replace("Exec=ros2-studio", "Exec=/usr/bin/ros2-studio"))
+            (package_root / "DEBIAN").mkdir()
+            (package_root / "DEBIAN/control").write_text(
+                f"Package: ros2-studio\nVersion: {arguments.version.replace('-alpha.', '~alpha.')}-1\nArchitecture: {architecture}\n"
+                "Maintainer: LJuliann <LJuliann@users.noreply.github.com>\nSection: devel\nPriority: optional\n"
+                f"Depends: libc6 (>= {'.'.join(map(str, glibc))}), libgcc-s1, libstdc++6, libasound2 | libasound2t64, libxkbcommon0, libxkbcommon-x11-0, libvulkan1, libwayland-client0, libfontconfig1, libfreetype6\n"
+                "Description: Standalone ROS 2 graph and node tools\n Design/live graph inspection, code generation, and build/run workflows.\n Source files open in your preferred external editor.\n"
+            )
+            run(["dpkg-deb", "--root-owner-group", "--build", str(package_root), str(artifact)])
+        checksum(artifact)
+    print(f"Created {artifact}; minimum GLIBC {'.'.join(map(str, glibc))}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    export = commands.add_parser("export", help="Create an independent source workspace in a NEW folder")
+    export.add_argument("destination", type=Path)
+    export.set_defaults(action=export_workspace)
+    for command in ("bundle", "deb"):
+        packaging = commands.add_parser(command, help="Package prebuilt standalone app and ROS daemon; does not compile or install")
+        packaging.add_argument("version")
+        packaging.add_argument("--app-binary", type=Path, default=ROOT / "target/release/ros2-studio")
+        packaging.add_argument("--daemon-binary", type=Path, default=ROOT / "target/ros-humble/release/ros-studio-daemon")
+        packaging.add_argument("--output", type=Path, default=ROOT / "target/standalone-dist")
+        packaging.add_argument("--glibc-max", help="Reject newer binaries; use 2.35 for an Ubuntu 22.04 build")
+        packaging.add_argument("--licenses", type=Path, required=True, help="Generated third-party notices for the standalone dependency graph")
+        packaging.add_argument("--keep-debug", action="store_true", help="Keep debug sections instead of stripping the packaged copies")
+        packaging.set_defaults(action=package)
+    arguments = parser.parse_args()
+    try:
+        arguments.action(arguments)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"Error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

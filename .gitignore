@@ -1,0 +1,5 @@
+/target/
+*.deb
+*.tar.gz
+*.sha256
+__pycache__/

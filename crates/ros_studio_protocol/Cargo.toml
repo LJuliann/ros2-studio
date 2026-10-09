@@ -1,0 +1,21 @@
+[package]
+name = "ros_studio_protocol"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ros_studio_protocol.rs"
+doctest = false
+
+[dependencies]
+ros_studio_model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

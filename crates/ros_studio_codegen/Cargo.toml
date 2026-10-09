@@ -1,0 +1,21 @@
+[package]
+name = "ros_studio_codegen"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ros_studio_codegen.rs"
+
+[dependencies]
+anyhow.workspace = true
+ros_studio_model.workspace = true
+tempfile.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+ros_studio_scan.workspace = true

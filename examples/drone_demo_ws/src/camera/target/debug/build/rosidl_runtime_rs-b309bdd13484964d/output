@@ -1,0 +1,7 @@
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/sensor_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/geometry_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/std_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/rosidl_generator_rs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/px4_msgs/lib
+cargo:rustc-link-search=native=/opt/ros/humble/lib
+cargo:rerun-if-changed=build.rs

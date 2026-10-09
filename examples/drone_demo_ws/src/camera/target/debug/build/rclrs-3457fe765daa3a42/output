@@ -1,0 +1,14 @@
+cargo:rustc-check-cfg=cfg(ros_distro, values("humble", "jazzy", "kilted", "rolling"))
+cargo:rustc-cfg=ros_distro="humble"
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/sensor_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/geometry_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/std_msgs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/rosidl_generator_rs/lib
+cargo:rustc-link-search=native=/opt/ros2-rust-overlay/install/px4_msgs/lib
+cargo:rustc-link-search=native=/opt/ros/humble/lib
+cargo:rustc-link-lib=dylib=rcl
+cargo:rustc-link-lib=dylib=rcl_action
+cargo:rustc-link-lib=dylib=rcl_yaml_param_parser
+cargo:rustc-link-lib=dylib=rcutils
+cargo:rustc-link-lib=dylib=rmw
+cargo:rustc-link-lib=dylib=rmw_implementation

@@ -1,0 +1,11 @@
+[package]
+name = "detector"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "detector"
+path = "src/detector.rs"
+
+[workspace]

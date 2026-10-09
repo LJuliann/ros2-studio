@@ -1,0 +1,26 @@
+[package]
+name = "ros_studio_scan"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ros_studio_scan.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+quick-xml.workspace = true
+ros_studio_model.workspace = true
+tree-sitter.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

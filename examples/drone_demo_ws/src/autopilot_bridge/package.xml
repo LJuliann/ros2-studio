@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>autopilot_bridge</name>
+  <version>0.1.0</version>
+  <description>Forwards navigation commands to the autopilot.</description>
+  <maintainer email="juliann@example.com">Juliann</maintainer>
+  <license>GPL-3.0-or-later</license>
+</package>
