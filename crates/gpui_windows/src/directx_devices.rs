@@ -78,9 +78,13 @@ fn check_debug_layer_available() -> bool {
     {
         use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
-        unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
-            .log_err()
-            .is_some()
+        match unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) } {
+            Ok(_) => true,
+            Err(error) => {
+                log::debug!("Optional DXGI debug interface unavailable: {error}");
+                false
+            }
+        }
     }
     #[cfg(not(debug_assertions))]
     {
@@ -94,7 +98,7 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
         DXGI_CREATE_FACTORY_DEBUG
     } else {
         #[cfg(debug_assertions)]
-        log::warn!(
+        log::debug!(
             "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
         );
         DXGI_CREATE_FACTORY_FLAGS::default()

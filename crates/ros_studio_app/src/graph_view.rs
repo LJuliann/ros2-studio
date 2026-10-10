@@ -970,12 +970,15 @@ impl GraphView {
         let running = self.active.is_some() || self.launch_pending;
         toolbar_group()
             .child(
-                button("runtime-configurations", "Configuration…")
-                    .when(self.show_configurations, selected_button)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_configurations = !this.show_configurations;
-                        cx.notify();
-                    })),
+                selectable_button(
+                    "runtime-configurations",
+                    "Configuration…",
+                    self.show_configurations,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_configurations = !this.show_configurations;
+                    cx.notify();
+                })),
             )
             .child(
                 button("runtime-build", "Build")
@@ -983,21 +986,24 @@ impl GraphView {
                     .on_click(cx.listener(|this, _, _, cx| this.launch(Operation::Build, cx))),
             )
             .child(
-                button("runtime-run", "Run")
-                    .bg(rgb(theme::SUCCESS_BACKGROUND))
-                    .text_color(rgb(theme::SUCCESS))
-                    .hover(|button| button.bg(rgb(theme::SUCCESS_HOVER)))
-                    .when(running, |button| button.opacity(0.5))
-                    .on_click(cx.listener(|this, _, _, cx| this.launch(Operation::Run, cx))),
+                colored_button(
+                    "runtime-run",
+                    "Run",
+                    theme::SUCCESS_BACKGROUND,
+                    theme::SUCCESS,
+                    theme::SUCCESS_HOVER,
+                )
+                .when(running, |button| button.opacity(0.5))
+                .on_click(cx.listener(|this, _, _, cx| this.launch(Operation::Run, cx))),
             )
             .child(
-                button(
+                colored_button(
                     "runtime-stop",
                     if self.stopping { "Stopping…" } else { "Stop" },
+                    theme::ERROR_BACKGROUND,
+                    theme::ERROR,
+                    theme::ERROR_HOVER,
                 )
-                .bg(rgb(theme::ERROR_BACKGROUND))
-                .text_color(rgb(theme::ERROR))
-                .hover(|button| button.bg(rgb(theme::ERROR_HOVER)))
                 .when(!running, |button| button.opacity(0.5))
                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
             )
@@ -1040,8 +1046,7 @@ impl GraphView {
                         .into_iter()
                         .enumerate()
                         .map(|(index, mode)| {
-                            button(("mode", index), mode.label())
-                                .when(self.mode == mode, selected_button)
+                            selectable_button(("mode", index), mode.label(), self.mode == mode)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.mode = mode;
                                     this.rebuild_graph(cx);
@@ -1106,15 +1111,15 @@ impl GraphView {
                         })),
                     )
                     .child(
-                        button(
+                        selectable_button(
                             "runtime-auto-mode",
                             if self.auto_mode {
                                 "Auto: on"
                             } else {
                                 "Auto: off"
                             },
+                            self.auto_mode,
                         )
-                        .when(self.auto_mode, selected_button)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.auto_mode = !this.auto_mode;
                             this.save_preferences(cx);
@@ -1134,36 +1139,32 @@ impl GraphView {
             .child(
                 toolbar_group()
                     .child(
-                        button(
+                        selectable_button(
                             "runtime-make-panel",
                             format!("Make ({})", self.make_catalog.targets.len()),
+                            self.show_make_panel,
                         )
-                        .when(self.show_make_panel, selected_button)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_make_panel = !this.show_make_panel;
                             cx.notify();
                         })),
                     )
                     .child(
-                        button("runtime-console", "Console")
-                            .when(self.console_visible, selected_button)
+                        selectable_button("runtime-console", "Console", self.console_visible)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.console_visible = !this.console_visible;
                                 cx.notify();
                             })),
                     )
                     .child(
-                        button(
+                        selectable_button(
                             "runtime-health",
                             if health_alerts == 0 {
                                 "Health".to_owned()
                             } else {
                                 format!("Health · {health_alerts} alerts")
                             },
-                        )
-                        .when(
                             self.inspector_view == InspectorView::Health,
-                            selected_button,
                         )
                         .when(health_alerts > 0, |button| {
                             button
@@ -2317,22 +2318,29 @@ impl Render for GraphView {
                                 )),
                             )
                             .child(
-                                button("new-node", "+ New node")
-                                    .bg(rgb(theme::PRIMARY))
-                                    .hover(|button| button.bg(rgb(theme::PRIMARY_HOVER)))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.new_node(window, cx)
-                                        }),
-                                    ),
+                                colored_button(
+                                    "new-node",
+                                    "+ New node",
+                                    theme::PRIMARY,
+                                    theme::TEXT,
+                                    theme::PRIMARY_HOVER,
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_node(window, cx)),
+                                ),
                             )
                             .child(
-                                button("editor", format!("Editor: {}", self.editor.label()))
-                                    .when(self.show_editors, selected_button)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                selectable_button(
+                                    "editor",
+                                    format!("Editor: {}", self.editor.label()),
+                                    self.show_editors,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.show_editors = !this.show_editors;
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
                             ),
                     )
                     .child(self.execution_toolbar(cx)),
@@ -2417,17 +2425,24 @@ impl Render for GraphView {
                             .into_iter()
                             .enumerate()
                             .map(|(index, (label, view))| {
-                                button(("inspector-summary", index), label)
-                                    .px_2()
-                                    .py_0()
-                                    .min_h(px(24.0))
-                                    .text_xs()
-                                    .text_color(rgb(theme::MUTED))
-                                    .when(self.inspector_view == view, selected_button)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                selectable_button(
+                                    ("inspector-summary", index),
+                                    label,
+                                    self.inspector_view == view,
+                                )
+                                .px_2()
+                                .py_0()
+                                .min_h(px(24.0))
+                                .text_xs()
+                                .when(self.inspector_view != view, |button| {
+                                    button.text_color(rgb(theme::MUTED))
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.inspector_view = view;
                                         cx.notify();
-                                    }))
+                                    },
+                                ))
                             }),
                         ),
                     ),
@@ -2585,6 +2600,28 @@ pub(super) fn button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
 ) -> Stateful<Div> {
+    colored_button(id, label, theme::ELEVATED, theme::TEXT, theme::HOVER)
+}
+
+fn selectable_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+) -> Stateful<Div> {
+    if selected {
+        colored_button(id, label, theme::SELECTED, theme::ACCENT, theme::PRIMARY)
+    } else {
+        button(id, label)
+    }
+}
+
+fn colored_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    background: u32,
+    foreground: u32,
+    hover_background: u32,
+) -> Stateful<Div> {
     div()
         .id(id)
         .px_3()
@@ -2593,19 +2630,12 @@ pub(super) fn button(
         .flex()
         .items_center()
         .rounded_md()
-        .bg(rgb(theme::ELEVATED))
+        .bg(rgb(background))
         .cursor_pointer()
         .text_sm()
-        .text_color(rgb(theme::TEXT))
-        .hover(|button| button.bg(rgb(theme::HOVER)))
+        .text_color(rgb(foreground))
+        .hover(|button| button.bg(rgb(hover_background)))
         .child(label.into())
-}
-
-fn selected_button(button: Stateful<Div>) -> Stateful<Div> {
-    button
-        .bg(rgb(theme::SELECTED))
-        .text_color(rgb(theme::ACCENT))
-        .hover(|button| button.bg(rgb(theme::PRIMARY)))
 }
 
 fn toolbar_group() -> Div {

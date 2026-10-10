@@ -11,8 +11,15 @@ ROS 2 Studio does not launch WSL or require an Ubuntu distribution.
   protocol, and daemon. Two real ROS/Docker integration tests remain opt-in.
 - `cargo clippy -p ros_studio_app --no-default-features --all-targets --no-deps
   -- -D warnings`: passed.
+- GUI binary Clippy (`--bin ros2-studio --no-deps -- -D warnings`): passed
+  after the startup correction.
 - Native development executable: built successfully; `ros2-studio.exe --help`
   starts successfully.
+- Native GUI startup with ROS2-Drone: the window opens and remains responsive
+  on the NVIDIA GeForce GTX 1080, using Direct3D 11.1 hardware acceleration.
+  Startup exposed duplicate hover-style registration on toolbar buttons; all
+  button variants now register their hover style once. The absent optional DXGI
+  debug interface is logged at debug level instead of as a startup error.
 - All 18 DirectX release shaders compile with the Windows SDK's `fxc`.
   The vendored GPUI shaders still emit compiler warnings.
 - Static inspection of the local Dronolab/ROS2-Drone checkout: 9 packages,
