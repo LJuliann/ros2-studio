@@ -20,6 +20,11 @@ ROS 2 Studio does not launch WSL or require an Ubuntu distribution.
   Startup exposed duplicate hover-style registration on toolbar buttons; all
   button variants now register their hover style once. The absent optional DXGI
   debug interface is logged at debug level instead of as a startup error.
+- Optimized Windows `release-fast` build: compiled successfully, including the
+  embedded optimized DirectX shaders. `--help` passes and the native window
+  opens with ROS2-Drone on the GTX 1080. Dragging/zooming performance still needs
+  a user comparison with the development build; no FPS or latency measurement
+  has been collected. Windows instructions now use this profile for testing.
 - All 18 DirectX release shaders compile with the Windows SDK's `fxc`.
   The vendored GPUI shaders still emit compiler warnings.
 - Static inspection of the local Dronolab/ROS2-Drone checkout: 9 packages,

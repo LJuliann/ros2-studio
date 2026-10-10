@@ -48,8 +48,13 @@ For development, install the Rust toolchain declared in `rust-toolchain.toml`
 and Visual Studio C++ Build Tools with a Windows SDK. From PowerShell:
 
 ```powershell
-cargo run --locked -j 2 -p ros_studio_app -- --editor code "C:\path\to\ROS2-Drone"
+cargo run --locked --profile release-fast -j 2 -p ros_studio_app -- --editor code "C:\path\to\ROS2-Drone"
 ```
+
+Use the optimized `release-fast` executable to assess interaction performance:
+`target/release-fast/ros2-studio.exe`. The default development build in
+`target/debug` uses unoptimized Rust code and DirectX shaders, which can make
+graph dragging and zooming slower. Docker is not needed for this comparison.
 
 Live, health monitoring, Build/Run, and Stop require Docker Desktop using Linux
 containers and a Linux `ros-studio-daemon` built with `ros-runtime`. Choose Auto
