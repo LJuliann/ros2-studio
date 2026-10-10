@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use async_channel::{Receiver, Sender};
 use futures::{
-    AsyncWrite, FutureExt as _, StreamExt as _,
+    AsyncReadExt as _, AsyncWrite, FutureExt as _, StreamExt as _,
     io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     pin_mut, select,
 };
@@ -20,14 +20,18 @@ use crate::{
     runtime::{Execution, Operation},
     runtime_environment::{LaunchPlan, RuntimePreference, detect_runtime},
 };
+use ros_studio_protocol::health::{HealthReport, TopicWatch};
 
 pub enum ClientCommand {
+    ConfigureHealth(Vec<TopicWatch>),
     Launch(Execution),
     Stop(String),
     Shutdown,
 }
 
 pub enum RuntimeMessage {
+    Health(HealthReport),
+    HealthUnavailable(String),
     Environment(String),
     Output {
         stream: OutputStream,
@@ -102,6 +106,7 @@ pub async fn connect(
 
 #[derive(Clone, Copy)]
 enum Pending {
+    Health,
     Open,
     Discovery,
     Launch(Operation),
@@ -227,6 +232,7 @@ async fn run_session(
                         }).await?;
                     }
                     Ok(ClientCommand::Stop(id)) => request(&mut stdin, &mut next_id, &mut pending, Pending::Stop, Request::StopProcess { id }).await?,
+                    Ok(ClientCommand::ConfigureHealth(topics)) => request(&mut stdin, &mut next_id, &mut pending, Pending::Health, Request::ConfigureHealth { topics }).await?,
                 },
                 line = diagnostic => match line {
                     Some(line) => sender.send(RuntimeMessage::Output { stream: OutputStream::Stderr, text: format!("{}\n", line?) }).await?,
@@ -244,6 +250,7 @@ async fn run_session(
                     match decoded {
                         DaemonMessage::Event(event) => {
                             let message = match event {
+                                Event::HealthChanged { report } => RuntimeMessage::Health(report),
                                 Event::RuntimeGraphChanged { patch } => RuntimeMessage::Patch(patch),
                                 Event::ProcessOutput { stream, text, .. } => RuntimeMessage::Output { stream, text },
                                 Event::ProcessExited { id, success, code } => RuntimeMessage::Exited { id, success, code },
@@ -256,6 +263,10 @@ async fn run_session(
                             let id = response.id.context("Daemon response has no request ID")?;
                             let (kind, _) = pending.remove(&id).context("Daemon response has an unknown request ID")?;
                             if let Some(error) = response.error {
+                                if matches!(kind, Pending::Health) {
+                                    sender.send(RuntimeMessage::HealthUnavailable(error.message)).await?;
+                                    continue;
+                                }
                                 if matches!(kind, Pending::Open) { bail!("Cannot open workspace: {}", error.message); }
                                 if matches!(kind, Pending::Discovery) { sender.send(RuntimeMessage::Ready { discovery: false }).await?; }
                                 sender.send(RuntimeMessage::Failed { operation: if let Pending::Launch(operation) = kind { Some(operation) } else { None }, message: error.message }).await?;
@@ -265,6 +276,7 @@ async fn run_session(
                                     (Pending::Discovery, Some(ResponseResult::Accepted {})) => sender.send(RuntimeMessage::Ready { discovery: true }).await?,
                                     (Pending::Launch(operation), Some(ResponseResult::ProcessStarted { id })) => sender.send(RuntimeMessage::Started { id, operation }).await?,
                                     (Pending::Stop, Some(ResponseResult::Accepted {})) => {},
+                                    (Pending::Health, Some(ResponseResult::Accepted {})) => {},
                                     _ => bail!("Unexpected daemon response result"),
                                 }
                             }
@@ -317,19 +329,22 @@ async fn run_session(
     conversation
 }
 
-async fn forward_output(
-    reader: impl futures::AsyncRead + Unpin,
+pub(crate) async fn forward_output(
+    mut reader: impl futures::AsyncRead + Unpin,
     stream: OutputStream,
     sender: &Sender<RuntimeMessage>,
 ) -> Result<()> {
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next().await {
-        sender
-            .send(RuntimeMessage::Output {
-                stream,
-                text: format!("{}\n", line?),
-            })
-            .await?;
+    let mut decoder = ros_studio_protocol::output::OutputDecoder::default();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        let text = decoder.decode(&buffer[..count], count == 0);
+        if !text.is_empty() {
+            sender.send(RuntimeMessage::Output { stream, text }).await?;
+        }
+        if count == 0 {
+            break;
+        }
     }
     Ok(())
 }
@@ -354,6 +369,237 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn health_events_and_old_daemon_rejections_do_not_interrupt_process_launches() -> Result<()> {
+        for supported in [true, false] {
+            futures::executor::block_on(async {
+                let root = tempfile::tempdir()?;
+                let watch = TopicWatch {
+                    topic: "/imu".into(),
+                    type_name: "sensor_msgs/msg/Imu".into(),
+                    expected_hz: 200.0,
+                    tolerance: 0.2,
+                    timeout_ms: 3000,
+                };
+                let observation = EventMessage::new(Event::HealthChanged {
+                    report: HealthReport {
+                        project_id: ros_studio_model::EntityId::new("project:test"),
+                        topics: vec![ros_studio_protocol::health::TopicHealth {
+                            topic: watch.topic.clone(),
+                            settings: watch.clone(),
+                            observed_hz: Some(200.0),
+                            age_ms: Some(0),
+                            state: ros_studio_protocol::health::TopicHealthState::Healthy,
+                            detail: "received".into(),
+                        }],
+                    },
+                });
+                let response = if supported {
+                    serde_json::to_string(&ResponseMessage::success(
+                        3,
+                        ResponseResult::Accepted {},
+                    ))?
+                } else {
+                    serde_json::to_string(&ResponseMessage::error(
+                        Some(3),
+                        -32601,
+                        "unknown configure_health method",
+                    ))?
+                };
+                let notification = if supported {
+                    format!("printf '%s\\n' '{}'", serde_json::to_string(&observation)?)
+                } else {
+                    String::new()
+                };
+                let script = format!(
+                    r#"
+read -r request
+printf '%s\n' '{{"jsonrpc":"2.0","protocol_version":1,"id":1,"result":{{"kind":"accepted"}}}}'
+read -r request
+printf '%s\n' '{{"jsonrpc":"2.0","protocol_version":1,"id":2,"result":{{"kind":"accepted"}}}}'
+read -r request
+printf '%s\n' '{response}'
+{notification}
+read -r request
+printf '%s\n' '{{"jsonrpc":"2.0","protocol_version":1,"id":4,"result":{{"kind":"process_started","id":"test-process"}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","protocol_version":1,"method":"process_exited","params":{{"id":"test-process","success":true,"code":0}}}}'
+while read -r request; do :; done
+"#
+                );
+                let plan = LaunchPlan {
+                    daemon: CommandSpec {
+                        program: "sh".into(),
+                        arguments: vec!["-c".into(), script.into()],
+                        directory: root.path().into(),
+                    },
+                    preparation: None,
+                    workspace: root.path().to_string_lossy().into_owned(),
+                    label: "Health client test".into(),
+                };
+                let (commands, receiver) = async_channel::unbounded();
+                let handle = SessionHandle::new(commands);
+                let (sender, events) = async_channel::bounded(32);
+                let client = run_session(plan, receiver, &sender);
+                let driver = async {
+                    let mut observed = false;
+                    let mut launched = false;
+                    while let Ok(event) = events.recv().await {
+                        match event {
+                            RuntimeMessage::Ready { discovery: true } => {
+                                handle.send(ClientCommand::ConfigureHealth(vec![watch.clone()]))?
+                            }
+                            RuntimeMessage::Health(report) => {
+                                ensure!(
+                                    supported && report.topics[0].observed_hz == Some(200.0),
+                                    "Incorrect health event"
+                                );
+                                observed = true;
+                            }
+                            RuntimeMessage::HealthUnavailable(message) => {
+                                ensure!(
+                                    !supported && message.contains("configure_health"),
+                                    "Incorrect capability error"
+                                );
+                                observed = true;
+                            }
+                            RuntimeMessage::Started { .. } => launched = true,
+                            RuntimeMessage::Exited { success: true, .. } => {
+                                ensure!(
+                                    observed && launched,
+                                    "Health must not interrupt process launching"
+                                );
+                                handle.send(ClientCommand::Shutdown)?;
+                                return Ok(());
+                            }
+                            RuntimeMessage::Failed { message, .. } => bail!("{message}"),
+                            _ => {}
+                        }
+                        if observed && !launched {
+                            handle.send(ClientCommand::Launch(Execution {
+                                operation: Operation::Build,
+                                label: "test".into(),
+                                command: vec!["test".into()],
+                            }))?;
+                            // Prevent duplicate launch while the started response is pending.
+                            launched = true;
+                        }
+                    }
+                    bail!("Health test session closed prematurely")
+                };
+                let completed = futures::future::try_join(client, driver).fuse();
+                let timeout =
+                    futures::FutureExt::fuse(async_io::Timer::after(Duration::from_secs(5)));
+                pin_mut!(completed, timeout);
+                select! { result = completed => { result?; }, _ = timeout => bail!("Health client test timed out") }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a rebuilt ROS runtime daemon and sourced ROS Humble or Docker; creates only a dedicated test topic"]
+    fn real_daemon_measures_topic_rate_then_silence_and_removes_the_watch() -> Result<()> {
+        futures::executor::block_on(async {
+            use ros_studio_protocol::health::TopicHealthState;
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/drone_demo_ws")
+                .canonicalize()?;
+            let plan = detect_runtime(&root, RuntimePreference::from_environment()?)?;
+            let topic = format!("/ros_studio_health_smoke_{}", std::process::id());
+            let (commands, receiver) = async_channel::unbounded();
+            let handle = SessionHandle::new(commands);
+            let (sender, events) = async_channel::bounded(256);
+            let client = run_session(plan, receiver, &sender);
+            let driver = async {
+                let mut process = None;
+                let mut stopped = false;
+                let mut exited = false;
+                let mut removing = false;
+                while let Ok(event) = events.recv().await {
+                    match event {
+                        RuntimeMessage::Ready { discovery: true } => {
+                            handle.send(ClientCommand::ConfigureHealth(vec![TopicWatch {
+                                topic: topic.clone(),
+                                type_name: "std_msgs/msg/String".into(),
+                                expected_hz: 20.0,
+                                tolerance: 0.2,
+                                timeout_ms: 2000,
+                            }]))?;
+                            handle.send(ClientCommand::Launch(Execution {
+                                operation: Operation::Run,
+                                label: "Health smoke publisher".into(),
+                                command: vec![
+                                    "ros2".into(),
+                                    "topic".into(),
+                                    "pub".into(),
+                                    "--rate".into(),
+                                    "20".into(),
+                                    topic.clone(),
+                                    "std_msgs/msg/String".into(),
+                                    "{data: hello}".into(),
+                                ],
+                            }))?;
+                        }
+                        RuntimeMessage::Started { id, .. } => process = Some(id),
+                        RuntimeMessage::Exited { .. } => exited = true,
+                        RuntimeMessage::Health(report) => {
+                            if removing && report.topics.is_empty() {
+                                ensure!(
+                                    exited && stopped,
+                                    "Watch cleared before publisher was stopped"
+                                );
+                                handle.send(ClientCommand::Shutdown)?;
+                                return Ok(());
+                            }
+                            if let Some(observed) = report
+                                .topics
+                                .iter()
+                                .find(|observed| observed.topic == topic)
+                            {
+                                if observed.state == TopicHealthState::Healthy
+                                    && !stopped
+                                    && let Some(id) = &process
+                                {
+                                    ensure!(
+                                        observed
+                                            .observed_hz
+                                            .is_some_and(|hz| (16.0..=24.0).contains(&hz)),
+                                        "Incorrect rate"
+                                    );
+                                    handle.send(ClientCommand::Stop(id.clone()))?;
+                                    stopped = true;
+                                }
+                                if stopped
+                                    && exited
+                                    && !removing
+                                    && observed.state == TopicHealthState::Missing
+                                {
+                                    handle.send(ClientCommand::ConfigureHealth(vec![]))?;
+                                    removing = true;
+                                }
+                                if observed.state == TopicHealthState::Unavailable {
+                                    bail!("{}", observed.detail);
+                                }
+                            }
+                        }
+                        RuntimeMessage::HealthUnavailable(message)
+                        | RuntimeMessage::Failed { message, .. } => bail!("{message}"),
+                        _ => {}
+                    }
+                }
+                bail!("Health smoke session closed before completion")
+            };
+            let completed = futures::future::try_join(client, driver).fuse();
+            let timeout = futures::FutureExt::fuse(async_io::Timer::after(Duration::from_secs(45)));
+            pin_mut!(completed, timeout);
+            select! { result = completed => { result?; }, _ = timeout => bail!("ROS health smoke timed out") }
+            Ok(())
+        })
     }
 
     #[cfg(target_os = "linux")]

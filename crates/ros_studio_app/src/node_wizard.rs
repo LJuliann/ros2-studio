@@ -18,6 +18,7 @@ use ros_studio_model::{EndpointKind, Project, SourceLocation};
 use crate::{
     graph_view::button,
     text_input::{Changed, TextInput},
+    theme,
 };
 
 pub enum WizardEvent {
@@ -214,7 +215,7 @@ impl NodeWizard {
                     ("package", index),
                     format!("{} · {}", package.name, package.path),
                 )
-                .when(selected, |button| button.bg(rgb(0x425c7f)))
+                .when(selected, |button| button.bg(rgb(theme::SELECTED)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.draft.package_id = Some(package.id.clone());
                     this.draft.api = ApiSelection::Auto;
@@ -279,7 +280,9 @@ impl NodeWizard {
                             .enumerate()
                             .map(|(index, (label, api))| {
                                 button(("api", index), label)
-                                    .when(self.draft.api == api, |button| button.bg(rgb(0x425c7f)))
+                                    .when(self.draft.api == api, |button| {
+                                        button.bg(rgb(theme::SELECTED))
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.draft.api = api;
                                         this.error = None;
@@ -311,7 +314,7 @@ impl NodeWizard {
             .gap_2()
             .p_3()
             .border_1()
-            .border_color(rgb(0x454f60))
+            .border_color(rgb(theme::BORDER))
             .rounded_md()
             .child(format!("{} · {}", topic.name, topic.type_name))
             .child(hint(format!(
@@ -333,7 +336,7 @@ impl NodeWizard {
                                 ("interface", index * 2 + kind_index),
                                 format!("{} {label}", if selected { "✓" } else { "+" }),
                             )
-                            .when(selected, |button| button.bg(rgb(0x425c7f)))
+                            .when(selected, |button| button.bg(rgb(theme::SELECTED)))
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     if !this.draft.interfaces.remove(&interface) {
@@ -363,7 +366,7 @@ impl NodeWizard {
             .gap_2()
             .p_4()
             .border_t_1()
-            .border_color(rgb(0x454f60))
+            .border_color(rgb(theme::BORDER))
             .child(
                 button("wizard-cancel", "Cancel")
                     .when(self.busy, |button| button.opacity(0.5))
@@ -384,7 +387,7 @@ impl NodeWizard {
             })
             .child(
                 button("wizard-confirm", label)
-                    .bg(rgb(0x365b87))
+                    .bg(rgb(theme::PRIMARY))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if previewing {
                             this.create(window, cx);
@@ -425,9 +428,9 @@ impl Render for NodeWizard {
             .w_full()
             .max_w(px(850.0))
             .h_full()
-            .bg(rgb(0x303846))
+            .bg(rgb(theme::SURFACE))
             .border_1()
-            .border_color(rgb(0x526079))
+            .border_color(rgb(theme::BORDER))
             .rounded_lg()
             .overflow_hidden()
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
@@ -453,7 +456,7 @@ impl Render for NodeWizard {
                 div()
                     .p_4()
                     .border_b_1()
-                    .border_color(rgb(0x454f60))
+                    .border_color(rgb(theme::BORDER))
                     .child(div().text_xl().child(if previewing {
                         "Preview ROS node"
                     } else {
@@ -463,7 +466,13 @@ impl Render for NodeWizard {
             )
             .child(body)
             .when_some(self.error.clone(), |body, error| {
-                body.child(div().p_3().bg(rgb(0x56353a)).text_sm().child(error))
+                body.child(
+                    div()
+                        .p_3()
+                        .bg(rgb(theme::ERROR_BACKGROUND))
+                        .text_sm()
+                        .child(error),
+                )
             })
             .child(self.footer(cx))
     }
@@ -476,12 +485,15 @@ fn section(title: &'static str) -> gpui::Div {
         .gap_2()
         .p_3()
         .rounded_md()
-        .bg(rgb(0x2a313d))
+        .bg(rgb(theme::ELEVATED))
         .child(div().text_lg().child(title))
 }
 
 fn hint(text: impl Into<gpui::SharedString>) -> gpui::Div {
-    div().text_sm().text_color(rgb(0xabb5c5)).child(text.into())
+    div()
+        .text_sm()
+        .text_color(rgb(theme::MUTED))
+        .child(text.into())
 }
 
 fn code_preview(title: &'static str, path: &std::path::Path, source: &str) -> gpui::Div {
@@ -491,7 +503,7 @@ fn code_preview(title: &'static str, path: &std::path::Path, source: &str) -> gp
             div()
                 .id(title)
                 .overflow_x_scroll()
-                .bg(rgb(0x232a34))
+                .bg(rgb(theme::INPUT))
                 .p_3()
                 .text_sm()
                 .font_family("monospace")

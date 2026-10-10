@@ -8,11 +8,15 @@ use ros_studio_protocol::{
 };
 use serde_json::Value;
 
+pub mod health;
+#[cfg(any(feature = "ros-runtime", test))]
 mod process;
 pub mod runtime_graph;
 
 #[cfg(feature = "ros-runtime")]
 mod runtime;
+#[cfg(feature = "ros-runtime")]
+mod runtime_health;
 
 #[cfg(feature = "ros-runtime")]
 pub use runtime::serve_ros_stdio;
@@ -54,6 +58,7 @@ fn handle_request(message: RequestMessage) -> ResponseMessage {
             ResponseMessage::success(message.id, ResponseResult::Accepted {})
         }
         Request::StartRuntimeDiscovery {}
+        | Request::ConfigureHealth { .. }
         | Request::Launch { .. }
         | Request::StopProcess { .. }
         | Request::GetParameters { .. }
@@ -86,6 +91,7 @@ pub(crate) fn malformed_request(line: &str, error: &serde_json::Error) -> Respon
         "open_workspace"
             | "start_runtime_discovery"
             | "stop_runtime_discovery"
+            | "configure_health"
             | "launch"
             | "stop_process"
             | "get_parameters"

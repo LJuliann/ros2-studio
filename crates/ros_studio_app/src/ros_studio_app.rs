@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+pub mod health;
 mod layout;
+pub mod local_process;
+pub mod makefile;
 pub mod preferences;
 pub mod runtime;
 pub mod runtime_client;
@@ -22,6 +25,15 @@ use ros_studio_model::{
 
 pub const NODE_WIDTH: f32 = 260.0;
 pub const NODE_HEIGHT: f32 = 180.0;
+
+/// Keep the normal desktop size, but leave space for window decorations on
+/// small/scaled screens. Inputs are the display's visible logical dimensions.
+pub fn initial_window_size(available_width: f32, available_height: f32) -> (f32, f32) {
+    (
+        (available_width - 48.0).clamp(1.0, 1280.0),
+        (available_height - 80.0).clamp(1.0, 800.0),
+    )
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GraphEdge {
@@ -257,6 +269,60 @@ impl Viewport {
         self.x = width / 2.0 - (left + right) * self.scale / 2.0;
         self.y = height / 2.0 - (top + bottom) * self.scale / 2.0;
     }
+
+    /// Opening a project favors legible cards over an overview of every family.
+    /// Dimensions are logical canvas pixels: GPUI already accounts for monitor
+    /// DPI, toolbars and sidebars. Do not multiply them by the display scale.
+    pub fn open_project(&mut self, positions: &[NodePosition], width: f32, height: f32) {
+        if positions.is_empty()
+            || !width.is_finite()
+            || !height.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+            || positions
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            return;
+        }
+        let left = positions.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let top = positions.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let right = positions
+            .iter()
+            .map(|p| p.x + NODE_WIDTH)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = positions
+            .iter()
+            .map(|p| p.y + NODE_HEIGHT)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if ![left, top, right, bottom].into_iter().all(f32::is_finite) {
+            return;
+        }
+
+        let padding = 24.0;
+        let available_width = (width - padding * 2.0).max(1.0);
+        let available_height = (height - padding * 2.0).max(1.0);
+        let preferred = (height / 720.0).sqrt().clamp(1.0, 1.15);
+        // Try to show the full width, but never shrink a large project into tiny
+        // cards just because it has many columns or disconnected families.
+        self.scale = (available_width / (right - left))
+            .clamp(0.9, preferred)
+            .min(available_width / NODE_WIDTH)
+            .min(available_height / NODE_HEIGHT)
+            .clamp(0.25, 1.15);
+        // Center an axis if it fits. Otherwise start at the first row/column,
+        // leaving the rest accessible by panning instead of clipping the roots.
+        self.x = if (right - left) * self.scale <= available_width {
+            width / 2.0 - (left + right) * self.scale / 2.0
+        } else {
+            padding - left * self.scale
+        };
+        self.y = if (bottom - top) * self.scale <= available_height {
+            height / 2.0 - (top + bottom) * self.scale / 2.0
+        } else {
+            padding - top * self.scale
+        };
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -471,8 +537,14 @@ mod tests {
         }
         let graph = GraphSnapshot::scan(directory.path())?;
         assert_eq!(graph.project.packages.len(), 4);
-        assert_eq!(graph.project.nodes.len(), 4);
-        for name in ["camera", "detector", "navigation", "autopilot_bridge"] {
+        assert_eq!(graph.project.nodes.len(), 5);
+        for name in [
+            "camera",
+            "detector",
+            "navigation",
+            "autopilot_bridge",
+            "test",
+        ] {
             assert!(
                 graph
                     .project
@@ -545,11 +617,13 @@ mod tests {
             .context("Missing publisher")?
             .clone();
         camera.endpoints.push(publisher);
+        let camera_id = camera.id.as_str().to_owned();
         let detector = project
             .nodes
             .iter_mut()
             .find(|node| node.logical_name == "detector")
             .context("Missing detector")?;
+        let detector_id = detector.id.as_str().to_owned();
         let subscription = detector
             .endpoints
             .iter_mut()
@@ -559,7 +633,9 @@ mod tests {
         assert_eq!(
             graph_edges(&project)
                 .iter()
-                .filter(|edge| edge.topic == "/camera/image")
+                .filter(|edge| edge.topic == "/camera/image"
+                    && edge.publisher_id == camera_id
+                    && edge.subscriber_id == detector_id)
                 .count(),
             1
         );
@@ -577,7 +653,9 @@ mod tests {
         assert!(
             !graph_edges(&project)
                 .iter()
-                .any(|edge| edge.topic == "/camera/image")
+                .any(|edge| edge.topic == "/camera/image"
+                    && edge.publisher_id == camera_id
+                    && edge.subscriber_id == detector_id)
         );
         Ok(())
     }
@@ -640,6 +718,126 @@ mod tests {
             viewport.screen_point(-700.0 + NODE_WIDTH / 2.0, 900.0 + NODE_HEIGHT / 2.0),
             (500.0, 350.0)
         );
+    }
+
+    fn opening_positions() -> Vec<NodePosition> {
+        // A narrow project with enough disconnected families to exceed one page.
+        (0..6)
+            .flat_map(|row| {
+                (0..2).map(move |column| NodePosition {
+                    node_id: format!("node-{row}-{column}"),
+                    x: -400.0 + column as f32 * 520.0,
+                    y: 800.0 + row as f32 * 260.0,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn initial_window_stays_inside_small_or_scaled_displays() {
+        assert_eq!(initial_window_size(1280.0, 720.0), (1232.0, 640.0));
+        assert_eq!(initial_window_size(1920.0, 1080.0), (1280.0, 800.0));
+        assert_eq!(initial_window_size(2560.0, 1440.0), (1280.0, 800.0));
+        assert_eq!(
+            initial_window_size(1920.0 / 1.5, 1080.0 / 1.5),
+            (1232.0, 640.0)
+        );
+        assert_eq!(
+            initial_window_size(2560.0 / 2.0, 1440.0 / 2.0),
+            (1232.0, 640.0)
+        );
+    }
+
+    #[test]
+    fn opening_zoom_is_readable_for_720p_1080p_and_1440p_canvases() {
+        let positions = opening_positions();
+        // Logical canvas sizes after toolbar/status space and both sidebars.
+        for (width, height, expected_scale) in [
+            (680.0, 540.0, 0.9),
+            (1320.0, 900.0, (900.0_f32 / 720.0).sqrt()),
+            (1960.0, 1260.0, 1.15),
+        ] {
+            let mut opening = Viewport::default();
+            opening.open_project(&positions, width, height);
+            assert!((opening.scale - expected_scale).abs() < 0.001);
+            let (x, y) = opening.screen_point(positions[0].x, positions[0].y);
+            assert!(x >= 24.0 && y >= 24.0);
+            assert!(x + NODE_WIDTH * opening.scale <= width);
+            assert!(y + NODE_HEIGHT * opening.scale <= height);
+            // The explicit overview still fits every card on these canvases.
+            let mut overview = opening;
+            overview.fit(&positions, width, height);
+            assert!(overview.scale < opening.scale);
+            for position in &positions {
+                let (x, y) = overview.screen_point(position.x, position.y);
+                assert!(x >= 0.0 && y >= 0.0);
+                assert!(x + NODE_WIDTH * overview.scale <= width);
+                assert!(y + NODE_HEIGHT * overview.scale <= height);
+            }
+        }
+    }
+
+    #[test]
+    fn opening_zoom_uses_logical_canvas_dimensions_not_physical_monitor_pixels() {
+        let positions = opening_positions();
+        let mut at_720p = Viewport::default();
+        at_720p.open_project(&positions, 1280.0 - 600.0, 720.0 - 180.0);
+        let mut at_1080p_scaled = Viewport::default();
+        at_1080p_scaled.open_project(&positions, 1920.0 / 1.5 - 600.0, 1080.0 / 1.5 - 180.0);
+        let mut at_1440p_scaled = Viewport::default();
+        at_1440p_scaled.open_project(&positions, 2560.0 / 2.0 - 600.0, 1440.0 / 2.0 - 180.0);
+        assert_eq!(at_720p, at_1080p_scaled);
+        assert_eq!(at_720p, at_1440p_scaled);
+    }
+
+    #[test]
+    fn opening_centers_small_projects_and_anchors_oversized_projects_at_the_top_left() {
+        let mut positions = opening_positions();
+        let mut viewport = Viewport::default();
+        viewport.open_project(&positions[..1], 1320.0, 900.0);
+        assert_eq!(
+            viewport.screen_point(
+                positions[0].x + NODE_WIDTH / 2.0,
+                positions[0].y + NODE_HEIGHT / 2.0
+            ),
+            (660.0, 450.0)
+        );
+        positions[1].x += 4000.0;
+        viewport.open_project(&positions, 1320.0, 900.0);
+        assert_eq!(viewport.scale, 0.9);
+        assert_eq!(
+            viewport.screen_point(positions[0].x, positions[0].y),
+            (24.0, 24.0)
+        );
+        assert!(viewport.x.is_finite() && viewport.y.is_finite());
+    }
+
+    #[test]
+    fn opening_handles_tiny_empty_and_invalid_canvases_without_losing_the_viewport() {
+        let positions = opening_positions();
+        let mut viewport = Viewport::default();
+        viewport.open_project(&positions, 240.0, 180.0);
+        assert!((0.25..0.9).contains(&viewport.scale));
+        let (x, y) = viewport.screen_point(positions[0].x, positions[0].y);
+        assert!(x + NODE_WIDTH * viewport.scale <= 240.0);
+        assert!(y + NODE_HEIGHT * viewport.scale <= 180.0);
+        let previous = viewport;
+        for (width, height) in [
+            (0.0, 600.0),
+            (600.0, 0.0),
+            (-1.0, 600.0),
+            (f32::NAN, 600.0),
+            (600.0, f32::INFINITY),
+        ] {
+            viewport.open_project(&positions, width, height);
+            assert_eq!(viewport, previous);
+        }
+        viewport.open_project(&[], 1320.0, 900.0);
+        assert_eq!(viewport, previous);
+        let mut invalid_positions = positions;
+        invalid_positions[0].x = f32::NAN;
+        viewport.open_project(&invalid_positions, 1320.0, 900.0);
+        assert_eq!(viewport, previous);
     }
 
     #[test]

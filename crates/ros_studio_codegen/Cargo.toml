@@ -14,8 +14,6 @@ path = "src/ros_studio_codegen.rs"
 [dependencies]
 anyhow.workspace = true
 ros_studio_model.workspace = true
+ros_studio_scan.workspace = true
 tempfile.workspace = true
 toml_edit.workspace = true
-
-[dev-dependencies]
-ros_studio_scan.workspace = true

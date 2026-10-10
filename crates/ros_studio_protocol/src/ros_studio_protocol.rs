@@ -6,6 +6,10 @@ use ros_studio_model::{EntityId, Node, Package, SourceLocation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod health;
+pub mod output;
+use health::{HealthReport, TopicWatch};
+
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -48,6 +52,9 @@ pub enum Request {
     },
     StartRuntimeDiscovery {},
     StopRuntimeDiscovery {},
+    ConfigureHealth {
+        topics: Vec<TopicWatch>,
+    },
     Launch {
         command: Vec<String>,
         env: BTreeMap<String, String>,
@@ -150,6 +157,9 @@ impl EventMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Event {
+    HealthChanged {
+        report: HealthReport,
+    },
     StaticGraphChanged {
         patch: GraphPatch,
     },
@@ -272,6 +282,7 @@ mod tests {
         let requests = [
             Request::StartRuntimeDiscovery {},
             Request::StopRuntimeDiscovery {},
+            Request::ConfigureHealth { topics: Vec::new() },
             Request::Launch {
                 command: vec!["ros2".to_owned(), "launch".to_owned()],
                 env: BTreeMap::from([("ROS_DOMAIN_ID".to_owned(), "7".to_owned())]),

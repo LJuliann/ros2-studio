@@ -76,6 +76,79 @@
       "runtime_state": "unknown"
     },
     {
+      "id": "node:camera:src/camera/src/bin/test.rs:node",
+      "logical_name": "test",
+      "package_id": "package:camera",
+      "executable": "test",
+      "source_locations": [
+        {
+          "path": "src/camera/src/bin/test.rs",
+          "line": 6,
+          "column": 36
+        }
+      ],
+      "endpoints": [
+        {
+          "id": "endpoint:camera:test:publisher:/cmd_vel",
+          "kind": "publisher",
+          "name": "/cmd_vel",
+          "type_name": "geometry_msgs::msg::Twist",
+          "source_location": {
+            "path": "src/camera/src/bin/test.rs",
+            "line": 9,
+            "column": 79
+          },
+          "confidence": "confirmed_source",
+          "evidence": [
+            {
+              "kind": "source_literal",
+              "source_location": {
+                "path": "src/camera/src/bin/test.rs",
+                "line": 9,
+                "column": 79
+              },
+              "detail": "publisher topic literal"
+            }
+          ]
+        },
+        {
+          "id": "endpoint:camera:test:subscription:/camera/image",
+          "kind": "subscription",
+          "name": "/camera/image",
+          "type_name": "sensor_msgs::msg::Image",
+          "source_location": {
+            "path": "src/camera/src/bin/test.rs",
+            "line": 10,
+            "column": 89
+          },
+          "confidence": "confirmed_source",
+          "evidence": [
+            {
+              "kind": "source_literal",
+              "source_location": {
+                "path": "src/camera/src/bin/test.rs",
+                "line": 10,
+                "column": 89
+              },
+              "detail": "subscription topic literal"
+            }
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "source_literal",
+          "source_location": {
+            "path": "src/camera/src/bin/test.rs",
+            "line": 6,
+            "column": 36
+          },
+          "detail": "create_node name literal"
+        }
+      ],
+      "runtime_state": "unknown"
+    },
+    {
       "id": "node:camera:src/camera/src/camera.rs:node",
       "logical_name": "camera",
       "package_id": "package:camera",
@@ -95,7 +168,7 @@
           "type_name": "sensor_msgs::msg::Image",
           "source_location": {
             "path": "src/camera/src/camera.rs",
-            "line": 9,
+            "line": 11,
             "column": 57
           },
           "confidence": "confirmed_source",
@@ -104,7 +177,7 @@
               "kind": "source_literal",
               "source_location": {
                 "path": "src/camera/src/camera.rs",
-                "line": 9,
+                "line": 11,
                 "column": 57
               },
               "detail": "publisher topic literal"

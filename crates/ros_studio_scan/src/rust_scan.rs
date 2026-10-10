@@ -16,6 +16,16 @@ pub fn detect_rust_endpoints(
     source: &str,
     source_path: &str,
 ) -> anyhow::Result<Vec<DetectedRustEndpoint>> {
+    Ok(endpoints_with_bindings(source, source_path)?
+        .into_iter()
+        .map(|(endpoint, _)| endpoint)
+        .collect())
+}
+
+fn endpoints_with_bindings(
+    source: &str,
+    source_path: &str,
+) -> anyhow::Result<Vec<(DetectedRustEndpoint, Option<usize>)>> {
     let mut parser = tree_sitter::Parser::new();
     let language = tree_sitter_rust::LANGUAGE.into();
 
@@ -53,16 +63,19 @@ pub fn detect_rust_endpoints(
             continue;
         };
 
-        detected.push(DetectedRustEndpoint {
-            node_variable_name: node_variable_name.to_owned(),
-            kind,
-            topic_name,
-            type_name,
-            source_location: source_location(source_path, topic_node)?,
-        });
+        detected.push((
+            DetectedRustEndpoint {
+                node_variable_name: node_variable_name.to_owned(),
+                kind,
+                topic_name,
+                type_name,
+                source_location: source_location(source_path, topic_node)?,
+            },
+            resolve_binding(call, node_variable_name, source),
+        ));
     }
 
-    detected.sort_by(|left, right| left.source_location.cmp(&right.source_location));
+    detected.sort_by(|left, right| left.0.source_location.cmp(&right.0.source_location));
 
     Ok(detected)
 }
@@ -73,25 +86,38 @@ pub fn scan_rust_source(
     source: &str,
     source_path: &str,
 ) -> anyhow::Result<Vec<RosNode>> {
-    let detected_nodes = detect_rust_nodes(source, source_path)?;
-    let detected_endpoints = detect_rust_endpoints(source, source_path)?;
+    let detected_nodes = nodes_with_bindings(source, source_path)?;
+    let detected_endpoints = endpoints_with_bindings(source, source_path)?;
+    let mut binding_counts = std::collections::BTreeMap::new();
+    for (node, _) in &detected_nodes {
+        *binding_counts
+            .entry(node.variable_name.clone())
+            .or_insert(0usize) += 1;
+    }
     let mut nodes = Vec::with_capacity(detected_nodes.len());
 
-    for detected_node in detected_nodes {
+    for (detected_node, binding) in detected_nodes {
         let mut endpoints = detected_endpoints
             .iter()
-            .filter(|endpoint| endpoint.node_variable_name == detected_node.variable_name)
-            .map(|endpoint| to_model_endpoint(package, &detected_node, endpoint))
+            .filter(|(_, owner)| *owner == Some(binding))
+            .map(|(endpoint, _)| to_model_endpoint(package, &detected_node, endpoint))
             .collect::<Vec<_>>();
 
         endpoints.sort();
 
         let source_location = detected_node.source_location;
         let logical_name = detected_node.logical_name;
-        let node_id = EntityId::new(format!(
-            "node:{}:{source_path}:{}",
-            package.name, detected_node.variable_name
-        ));
+        // Preserve saved IDs for the usual single binding. Disambiguate only
+        // files that previously produced duplicate IDs.
+        let identity = if binding_counts[&detected_node.variable_name] > 1 {
+            format!(
+                "{}:{}:{}",
+                detected_node.variable_name, source_location.line, source_location.column
+            )
+        } else {
+            detected_node.variable_name
+        };
+        let node_id = EntityId::new(format!("node:{}:{source_path}:{identity}", package.name));
 
         nodes.push(RosNode {
             id: node_id,
@@ -158,6 +184,16 @@ pub struct DetectedRustEndpoint {
 }
 
 pub fn detect_rust_nodes(source: &str, source_path: &str) -> anyhow::Result<Vec<DetectedRustNode>> {
+    Ok(nodes_with_bindings(source, source_path)?
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect())
+}
+
+fn nodes_with_bindings(
+    source: &str,
+    source_path: &str,
+) -> anyhow::Result<Vec<(DetectedRustNode, usize)>> {
     let mut parser = tree_sitter::Parser::new();
     let language = tree_sitter_rust::LANGUAGE.into();
 
@@ -193,18 +229,21 @@ pub fn detect_rust_nodes(source: &str, source_path: &str) -> anyhow::Result<Vec<
             continue;
         };
 
-        let Some(variable_name) = enclosing_let_binding(call, source) else {
+        let Some((variable_name, binding)) = enclosing_let_binding(call, source) else {
             continue;
         };
 
-        detected.push(DetectedRustNode {
-            variable_name,
-            logical_name,
-            source_location: source_location(source_path, name_node)?,
-        });
+        detected.push((
+            DetectedRustNode {
+                variable_name,
+                logical_name,
+                source_location: source_location(source_path, name_node)?,
+            },
+            binding,
+        ));
     }
 
-    detected.sort_by(|left, right| left.source_location.cmp(&right.source_location));
+    detected.sort_by(|left, right| left.0.source_location.cmp(&right.0.source_location));
 
     Ok(detected)
 }
@@ -319,7 +358,7 @@ fn named_argument(call: Node<'_>, index: u32) -> Option<Node<'_>> {
     call.child_by_field_name("arguments")?.named_child(index)
 }
 
-fn enclosing_let_binding(call: Node<'_>, source: &str) -> Option<String> {
+fn enclosing_let_binding(call: Node<'_>, source: &str) -> Option<(String, usize)> {
     let mut ancestor = call.parent();
 
     while let Some(node) = ancestor {
@@ -327,7 +366,7 @@ fn enclosing_let_binding(call: Node<'_>, source: &str) -> Option<String> {
             let pattern = node.child_by_field_name("pattern")?;
 
             if pattern.kind() == "identifier" {
-                return Some(node_text(pattern, source)?.to_owned());
+                return Some((node_text(pattern, source)?.to_owned(), node.start_byte()));
             }
 
             return None;
@@ -336,6 +375,51 @@ fn enclosing_let_binding(call: Node<'_>, source: &str) -> Option<String> {
         ancestor = node.parent();
     }
 
+    None
+}
+
+// Resolve the closest preceding lexical binding, rather than matching a name
+// across unrelated functions. Initializers still see the previous binding.
+fn resolve_binding(call: Node<'_>, name: &str, source: &str) -> Option<usize> {
+    let mut child = call;
+    while let Some(parent) = child.parent() {
+        if matches!(parent.kind(), "block" | "source_file") {
+            let mut cursor = parent.walk();
+            let binding = parent
+                .named_children(&mut cursor)
+                .filter(|declaration| {
+                    declaration.kind() == "let_declaration"
+                        && declaration.end_byte() <= child.start_byte()
+                })
+                .filter(|declaration| {
+                    declaration
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| node_text(pattern, source) == Some(name))
+                })
+                .last();
+            if let Some(binding) = binding {
+                return Some(binding.start_byte());
+            }
+        }
+        if matches!(parent.kind(), "function_item" | "closure_expression") {
+            if let Some(parameters) = parent.child_by_field_name("parameters") {
+                let mut cursor = parameters.walk();
+                for parameter in parameters.named_children(&mut cursor) {
+                    let pattern = parameter
+                        .child_by_field_name("pattern")
+                        .unwrap_or(parameter);
+                    if node_text(pattern, source) == Some(name) {
+                        return Some(parameter.start_byte());
+                    }
+                }
+            }
+            // Functions cannot capture another function's locals; closures can.
+            if parent.kind() == "function_item" {
+                return None;
+            }
+        }
+        child = parent;
+    }
     None
 }
 
@@ -373,6 +457,44 @@ fn source_location(path: &str, node: Node<'_>) -> anyhow::Result<SourceLocation>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn associates_endpoints_with_lexical_bindings_and_unique_node_ids() -> anyhow::Result<()> {
+        let package = Package {
+            id: EntityId::new("package:demo"),
+            name: "demo".into(),
+            path: "src/demo".into(),
+        };
+        let source = r#"fn first() {
+            let node = executor.create_node("first")?;
+            node.create_publisher::<Message>("/first")?;
+            { let node = other; node.create_publisher::<Message>("/shadowed")?; }
+            let capture = || node.create_publisher::<Message>("/captured");
+            let argument = |node| node.create_publisher::<Message>("/argument");
+            fn nested(node: Node) { node.create_publisher::<Message>("/nested")?; }
+        }
+        fn second() {
+            let node = executor.create_node("second")?;
+            node.create_publisher::<Message>("/second")?;
+        }"#;
+        let nodes = scan_rust_source(&package, "demo", source, "src/main.rs")?;
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(nodes[0].id, nodes[1].id);
+        for node in nodes {
+            let names = node
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.name.as_str())
+                .collect::<Vec<_>>();
+            if node.logical_name == "first" {
+                assert_eq!(names, ["/captured", "/first"]);
+            } else {
+                assert_eq!(node.logical_name, "second");
+                assert_eq!(names, ["/second"]);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn detects_literal_node_name_and_location() -> anyhow::Result<()> {

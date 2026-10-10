@@ -10,6 +10,7 @@ use quick_xml::{Reader, events::Event};
 use ros_studio_model::{EntityId, Package, Project};
 use walkdir::{DirEntry, WalkDir};
 
+pub mod cargo;
 mod cpp_scan;
 mod python_scan;
 mod rust_scan;
@@ -167,9 +168,23 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
         let package = detected_package.package;
         let executable = package.name.clone();
         let package_root = root.join(&package.path);
+        let rust_targets = detected_package
+            .cargo_manifest_path
+            .as_ref()
+            .map(|manifest| cargo::binary_targets(&package_root, &fs::read_to_string(manifest)?))
+            .transpose()?
+            .unwrap_or_default();
 
         for source_path in detected_package.rust_source_paths {
-            let rust_executable = rust_executable_name(&source_path, &package_root, &executable);
+            let rust_executable = cargo::binary_for_source(&rust_targets, &source_path)
+                .or_else(|| {
+                    rust_targets
+                        .iter()
+                        .find(|target| target.name == executable)
+                        .map(|target| target.name.as_str())
+                })
+                .or_else(|| (rust_targets.len() == 1).then(|| rust_targets[0].name.as_str()))
+                .unwrap_or("");
             let source = fs::read_to_string(&source_path)
                 .with_context(|| format!("failed to read Rust source {}", source_path.display()))?;
 
@@ -185,7 +200,7 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
 
             nodes.extend(scan_rust_source(
                 &package,
-                &rust_executable,
+                rust_executable,
                 &source,
                 &relative_source_path,
             )?);
@@ -246,17 +261,6 @@ pub fn scan_project(root: &Path, project_name: &str) -> anyhow::Result<Project> 
     project.sort_deterministically();
 
     Ok(project)
-}
-
-fn rust_executable_name(source_path: &Path, package_root: &Path, package_name: &str) -> String {
-    source_path
-        .strip_prefix(package_root.join("src/bin"))
-        .ok()
-        .filter(|relative_path| relative_path.components().count() == 1)
-        .and_then(|relative_path| relative_path.file_stem())
-        .and_then(|file_stem| file_stem.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| package_name.to_owned())
 }
 
 fn normalized_path(path: &Path) -> anyhow::Result<String> {
@@ -366,10 +370,11 @@ mod tests {
                 Some(package_root.join("Cargo.toml"))
             );
 
-            assert_eq!(
-                detected.rust_source_paths,
-                vec![package_root.join("src").join(source_name)]
-            );
+            let mut expected_sources = vec![package_root.join("src").join(source_name)];
+            if detected.package.name == "camera" {
+                expected_sources.insert(0, package_root.join("src/bin/test.rs"));
+            }
+            assert_eq!(detected.rust_source_paths, expected_sources);
             assert!(detected.python_source_paths.is_empty());
             assert!(detected.cpp_source_paths.is_empty());
         }
@@ -382,26 +387,15 @@ mod tests {
         let package_root = fixture_workspace().join("src/camera");
         let sources = find_rust_sources(&package_root)?;
 
-        assert_eq!(sources, vec![package_root.join("src/camera.rs")]);
+        assert_eq!(
+            sources,
+            vec![
+                package_root.join("src/bin/test.rs"),
+                package_root.join("src/camera.rs")
+            ]
+        );
 
         Ok(())
-    }
-
-    #[test]
-    fn uses_binary_name_for_generated_rust_nodes() {
-        let package_root = Path::new("/workspace/src/camera");
-        assert_eq!(
-            rust_executable_name(
-                &package_root.join("src/bin/camera_backup.rs"),
-                package_root,
-                "camera"
-            ),
-            "camera_backup"
-        );
-        assert_eq!(
-            rust_executable_name(&package_root.join("src/camera.rs"), package_root, "camera"),
-            "camera"
-        );
     }
 
     #[test]
@@ -412,7 +406,7 @@ mod tests {
         assert_eq!(project.id.as_str(), "project:drone_demo_ws");
         assert_eq!(project.name, "drone_demo_ws");
         assert_eq!(project.packages.len(), 4);
-        assert_eq!(project.nodes.len(), 4);
+        assert_eq!(project.nodes.len(), 5);
 
         let graph = project
             .nodes
@@ -432,6 +426,7 @@ mod tests {
             graph,
             [
                 ("autopilot_bridge", vec!["/cmd_vel"]),
+                ("test", vec!["/cmd_vel", "/camera/image"]),
                 ("camera", vec!["/camera/image"]),
                 ("detector", vec!["/detections", "/camera/image"]),
                 ("navigation", vec!["/cmd_vel", "/detections"]),

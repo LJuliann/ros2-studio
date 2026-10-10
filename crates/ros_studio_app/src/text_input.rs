@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use crate::theme;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Point, Render,
@@ -38,6 +39,21 @@ impl TextInput {
 
     pub fn text(&self) -> &str {
         &self.buffer.text
+    }
+
+    pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
+        self.buffer = TextBuffer::default();
+        self.buffer.replace(0..0, &text);
+        self.scroll = px(0.0);
+        cx.emit(Changed);
+        cx.notify();
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.buffer = TextBuffer::default();
+        self.dragging = false;
+        self.scroll = px(0.0);
+        self.changed(false, cx);
     }
 
     fn changed(&mut self, normalize: bool, cx: &mut Context<Self>) {
@@ -261,14 +277,14 @@ impl Render for TextInput {
             .h_10()
             .px_3()
             .py_2()
-            .bg(rgb(0x242a34))
+            .bg(rgb(theme::INPUT))
             .border_1()
             .rounded_md()
             .overflow_hidden()
             .border_color(if self.focus.is_focused(window) {
-                rgb(0x7bb8ff)
+                rgb(theme::ACCENT)
             } else {
-                rgb(0x505d70)
+                rgb(theme::BORDER)
             })
             .cursor(gpui::CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::key_down))
@@ -312,7 +328,7 @@ impl Render for TextInput {
                             len: text.len(),
                             font: style.font(),
                             color: if empty {
-                                rgb(0x8390a2).into()
+                                rgb(theme::MUTED).into()
                             } else {
                                 style.color
                             },
@@ -361,7 +377,7 @@ impl Render for TextInput {
                                             bounds.bottom(),
                                         ),
                                     ),
-                                    rgb(0x425c7f),
+                                    rgb(theme::SELECTED),
                                 ));
                             }
                             if let Err(error) = line.paint(
@@ -380,7 +396,7 @@ impl Render for TextInput {
                                         point(origin.x + line.x_for_index(cursor), bounds.top()),
                                         size(px(2.0), bounds.size.height),
                                     ),
-                                    rgb(0x7bb8ff),
+                                    rgb(theme::ACCENT),
                                 ));
                             }
                         });

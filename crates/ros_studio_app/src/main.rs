@@ -4,6 +4,7 @@ mod console_view;
 mod graph_view;
 mod node_wizard;
 mod text_input;
+mod theme;
 
 use std::path::PathBuf;
 
@@ -99,7 +100,19 @@ fn main() -> Result<()> {
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+        // Display bounds are logical pixels too. Leave room for decorations and
+        // avoid opening an 800px-tall window off-screen on a 720p/scaled display.
+        let bounds = cx.primary_display().map_or_else(
+            || Bounds::centered(None, size(px(1280.0), px(800.0)), cx),
+            |display| {
+                let visible = display.visible_bounds();
+                let (width, height) = ros_studio_app::initial_window_size(
+                    visible.size.width.as_f32(),
+                    visible.size.height.as_f32(),
+                );
+                Bounds::centered_at(visible.center(), size(px(width), px(height)))
+            },
+        );
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

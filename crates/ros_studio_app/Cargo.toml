@@ -42,3 +42,6 @@ notify = { version = "9.0.0-rc.4", optional = true }
 walkdir = { workspace = true, optional = true }
 simplelog = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal"] }
+

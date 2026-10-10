@@ -351,27 +351,16 @@ pub fn preview_node_with_interfaces(
         .with_context(|| format!("Cannot read {}", manifest_path.display()))?;
     let mut manifest = DocumentMut::from_str(&manifest_before)
         .with_context(|| format!("Cannot parse {}", manifest_path.display()))?;
-    let package = manifest
-        .as_table()
-        .get("package")
-        .and_then(Item::as_table)
-        .context("Selected Cargo.toml does not declare a package")?;
     ensure!(
-        package.get("autobins").and_then(Item::as_bool) != Some(false),
+        ros_studio_scan::cargo::automatic_binaries_enabled(&package_root, &manifest_before)?,
         "This package disables automatic binaries; add a bin target manually first"
     );
-    if let Some(binaries) = manifest
-        .as_table()
-        .get("bin")
-        .and_then(Item::as_array_of_tables)
-    {
-        ensure!(
-            !binaries
-                .iter()
-                .any(|binary| binary.get("name").and_then(Item::as_str) == Some(node_name)),
-            "A binary target named {node_name} already exists"
-        );
-    }
+    ensure!(
+        ros_studio_scan::cargo::binary_targets(&package_root, &manifest_before)?
+            .iter()
+            .all(|binary| binary.name != node_name),
+        "A binary target named {node_name} already exists"
+    );
 
     let detection = detect_rclrs_api_in_manifest(project, &manifest_path, &manifest)?;
     let api = match (selection, &detection) {
@@ -558,6 +547,21 @@ pub fn write_node(preview: &NodePreview) -> anyhow::Result<PathBuf> {
         fs::read_to_string(&preview.manifest_path)? == preview.manifest_before,
         "Cargo.toml changed after the preview; review the changes again"
     );
+    let package_root = preview
+        .manifest_path
+        .parent()
+        .context("Cargo.toml has no parent")?;
+    let node_name = preview
+        .source_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .context("Generated binary name is not UTF-8")?;
+    ensure!(
+        ros_studio_scan::cargo::binary_targets(package_root, &preview.manifest_before)?
+            .iter()
+            .all(|binary| binary.name != node_name),
+        "A binary target named {node_name} appeared after the preview"
+    );
     let source_directory = preview
         .source_path
         .parent()
@@ -733,6 +737,49 @@ mod tests {
         let preview = preview_node(&project, &project.packages[0].id, "camera_backup")?;
         write_node(&preview)?;
         assert!(preview_node(&project, &project.packages[0].id, "camera_backup").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_packages_where_cargo_disables_automatic_binaries() -> anyhow::Result<()> {
+        for options in ["autobins=false\n", "edition='2015'\n"] {
+            let root = tempfile::tempdir()?;
+            let project = fixture(root.path())?;
+            let package = root.path().join("src/camera");
+            fs::write(package.join("src/main.rs"), "fn main() {}")?;
+            fs::write(
+                package.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='camera'\nversion='0.1.0'\n{options}[[bin]]\nname='camera'\npath='src/main.rs'\n"
+                ),
+            )?;
+            assert!(preview_node(&project, &project.packages[0].id, "new_node").is_err());
+            assert!(!package.join("src/bin/new_node.rs").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_implicit_main_directory_targets_and_targets_added_after_preview()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let project = fixture(root.path())?;
+        let package = root.path().join("src/camera");
+        fs::write(package.join("src/main.rs"), "fn main() {}")?;
+        assert!(preview_node(&project, &project.packages[0].id, "camera").is_err());
+        fs::create_dir_all(package.join("src/bin/backup"))?;
+        fs::write(package.join("src/bin/backup/main.rs"), "fn main() {}")?;
+        assert!(preview_node(&project, &project.packages[0].id, "backup").is_err());
+        let preview = preview_node(&project, &project.packages[0].id, "new_node")?;
+        fs::create_dir_all(package.join("src/bin/new_node"))?;
+        fs::write(package.join("src/bin/new_node/main.rs"), "fn main() {}")?;
+        let manifest_before = fs::read_to_string(package.join("Cargo.toml"))?;
+        assert!(write_node(&preview).is_err());
+        assert_eq!(
+            fs::read_to_string(package.join("Cargo.toml"))?,
+            manifest_before
+        );
+        assert!(!root.path().join(&preview.source_relative_path).exists());
         Ok(())
     }
 

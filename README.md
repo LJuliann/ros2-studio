@@ -17,7 +17,9 @@ From the repository root:
 CARGO_BUILD_JOBS=1 cargo run --profile release-fast -j 1 -p ros_studio_app -- --editor code examples/drone_demo_ws
 ```
 
-Omit the folder to choose it with **Open project**. Use **Editor** to choose
+Without a folder argument, the last successfully opened project is restored if
+it is still accessible; otherwise the usual empty page offers **Open project**.
+An explicit folder argument always takes precedence. Use **Editor** to choose
 System default, VS Code, VSCodium, Zed, or CLion. The choice applies to the
 saved preferences; `--editor` and `ROS_STUDIO_EDITOR` override the saved choice.
 
@@ -155,13 +157,26 @@ The daemon sources Humble, the optional Rust overlay, and `install/setup.bash`
 before running commands. Container-relative manifest paths are kept separate
 from the host paths used to open your editor.
 
+The dark UI keeps project actions and **Build / Run / Stop** in the top bar.
+Graph modes, runtime connection, Make/Console toggles, and zoom controls are
+grouped in the second row. The configuration strip shows the current target
+and clickable package/node/topic counts.
+
+Opening a project uses a readable zoom (normally 90–115%), based on the actual
+canvas in logical pixels so monitor scaling is not applied twice. Small graphs
+are centered; large ones start at their top/left and remain accessible by panning.
+**Fit graph** explicitly switches to an overview of the entire graph. Refreshing
+source files does not reset the current zoom or pan. Topic labels and card spacing
+scale with the cards.
+
 Select a node in the graph or inspector, then **Build** or **Run**: the selected
 node is the target, shown in the configuration label. No configuration chooser
 is needed. The target is saved when launched. With no selected node, the last
 chosen or restored configuration is reused; if neither exists, the chooser opens.
-**Configuration…** lets you choose another ROS node or a Rust, Python, C, or C++
-file inside the project. Choosing a file clears the node selection so Build/Run
-uses that file. **Shift+F10** runs the displayed target and **Alt+Shift+F10** opens
+**Configuration…** lets you choose another ROS node, a Rust/Python/C/C++ file,
+or a discovered Makefile target. Choosing a file or make target clears the node
+selection so Build/Run uses that configuration. **Shift+F10** runs the displayed
+target and **Alt+Shift+F10** opens
 the chooser. **Use as run configuration** saves a node target without launching.
 
 ROS node configurations:
@@ -180,10 +195,47 @@ File configurations:
 - C/C++ uses a syntax check for Build; Run compiles a temporary executable.
   A standalone file does not inherit a ROS package's colcon flags or dependencies.
 
-One process is allowed at a time. **Stop** stops the current process via the
-daemon; it also cancels a pending launch by closing that session. Disconnecting,
-changing projects, or closing the view requests session shutdown and stops
-the processes launched by that session, not unrelated ROS nodes.
+Make panel (host tasks):
+
+- Opening a project detects literal targets from the root `GNUmakefile`,
+  `makefile`, or `Makefile` and their local literal includes. The **Make commands**
+  sidebar opens automatically when targets are found. **Make (N)** closes or
+  reopens it; the file watcher keeps the list current. Discovery only reads
+  files; it never runs make, evaluates variables, or starts project commands.
+- Commands are grouped into **package** sections, collapsed by default. Associations are
+  inferred from literal ROS run/launch/build commands, Cargo manifest paths,
+  package-owned included files, and topic/service/action owners in the static
+  graph. Shared, ambiguous, or unknown commands stay in **Project / shared**.
+  Search matches package names as well as commands/files and exposes matching
+  commands even inside collapsed sections. Variables/macros are not evaluated.
+- Search the list and click **Run** beside `ros-build`, `ros-run`, or any other
+  target to execute it immediately. No run configuration is required, and a
+  selected graph node cannot override the clicked target. This does not change
+  your selected node or saved Build/Run configuration. The exact target runs;
+  the app does not guess another target or automatically build before Run.
+- The active command is highlighted; **Stop Make** interrupts it. Closing the
+  panel only hides it, and the main **Stop** and **Console** buttons still work.
+  Only one execution can be active, but its recipe can start multiple nodes.
+- Targets remain available in **Configuration…** for the optional Build/Run and
+  keyboard-shortcut workflow; both buttons execute the chosen Make target.
+- Make executes on the **host**, from the project folder, using the inherited
+  environment, without requiring the ROS daemon. This avoids nesting Docker when
+  a recipe already uses Compose. Install make and any tools required by the recipe.
+  Connect Live separately to discover nodes started by the recipe.
+- Output and errors appear in the same console. **Stop** interrupts make and its
+  foreground process group, with a two-second grace period before forced cleanup.
+  Recipes that detach containers/processes (such as `up -d`) need their own stop
+  target; the app does not automatically run `docker compose down`.
+- Only run trusted targets: recipes are arbitrary project code and may control
+  real hardware. Interactive recipes needing terminal input are not supported.
+  Computed targets/includes, pattern rules, and custom recipe prefixes are not
+  fully interpreted by this conservative discovery.
+
+One execution is allowed at a time (a make recipe can launch several nodes).
+**Stop** stops the current daemon process or host make task; it also cancels a
+pending launch. Disconnect only closes the ROS session, not an independent host
+make task. Changing projects or closing the view requests both sessions' cleanup,
+not cleanup of unrelated ROS nodes or detached services.
 Normal window closing waits for session cleanup. Forced termination or an
 operating-system shutdown cannot guarantee that cleanup finishes.
 Running a project executes its real code: test hardware-facing nodes only in a
@@ -195,11 +247,58 @@ keep your selected mode. Both retains static nodes and marks nodes not found
 in the live snapshot as Offline. Live may correctly be empty if nothing runs
 in the current ROS domain.
 
+**Health** opens the monitoring inspector. Choose an available topic, enter
+its expected Hz and a silence timeout, then **Save and monitor**. Settings are
+stored per project in application preferences, not in your source files. Saving
+starts a runtime connection if needed; saved watches resume on the next connection.
+Only explicitly selected topics are subscribed to (maximum 32).
+
+- **RATE OK**: received rate is within ±20% of the configured expectation.
+- **RATE WARNING**: received rate is too low or too high.
+- **NO DATA**: no message arrived before the configured silence deadline.
+- **WAITING / UNKNOWN / UNAVAILABLE**: warming up, disconnected/stale observer,
+  unsupported daemon, or missing message introspection/type support. These are
+  not reported as node crashes.
+
+The observer uses monotonic arrival times, a five-second rolling sample window,
+bounded memory, and best-effort/volatile subscriptions. It runs inside the same
+ROS daemon/environment as discovery, on Host or Docker, and receives data without
+publishing commands. This adds subscription/network/serialization load, especially
+for images: monitor important topics only. QoS and system load can affect the
+received rate; it is not necessarily the publisher's true rate or proof of correct
+processing. Very slow topics require a timeout longer than their normal interval.
+
+Live/Both cards and edges show monitoring evidence. **Node presence** also lists
+planned nodes absent from discovery. A topic's aggregated rate is never attributed
+to an individual node when several publishers share it, nor taken as proof that
+a subscriber processes its inputs. Green observations expire if reports stop;
+disconnecting or switching projects clears measurements. Closing the Health panel
+only hides it; **Stop watching** removes the selected subscription.
+
+This feature requires rebuilding **both the app and the ROS runtime daemon**.
+The ROS-free unit tests exercise rates/thresholds, silence/recovery, bounded memory,
+stale reports, publisher ambiguity, settings persistence and protocol compatibility.
+Actual receipt of messages still needs validation in a sourced ROS environment.
+
+Optional integration smoke test, after rebuilding the runtime daemon:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test -j 1 -p ros_studio_app --no-default-features --lib \
+  real_daemon_measures_topic_rate_then_silence_and_removes_the_watch -- --ignored --nocapture
+```
+
+It creates only a dedicated `/ros_studio_health_smoke_<pid>` String publisher
+at 20 Hz, checks reception and the silence alarm, then removes the watch and
+stops the test process/session. It does not start drone nodes or send commands
+to hardware. If using namespaces/remaps, choose the actual discovered topic;
+unresolved source-only message types are not offered for monitoring.
+
 The console is output-only, not an interactive terminal. It retains the latest
 5,000 lines, renders only visible rows, distinguishes stderr, and preserves
 partial output chunks. Drag or Shift-click to select entire lines, then Ctrl+C;
 Ctrl+A selects all lines. **Copy all**, **Clear**, and **Follow** are available.
-Scrolling up pauses follow once new output arrives. Drag the divider to resize;
+Scrolling up or selecting lines pauses follow; enabling Follow resumes it immediately
+and keeps it on as output arrives or the console is resized. Drag the divider to resize;
 **Close** only hides output (it does not stop the process); **Console** reopens it.
 
 Runtime support is currently Linux + a compatible ROS Humble environment.
@@ -207,7 +306,7 @@ Windows/WSL runtime and arbitrary ROS distributions are not yet validated.
 
 ## Preferences
 
-Editor, environment preference, Auto mode, console height, and each project's
+Editor, environment preference, Auto mode, console height, the last opened project, and each project's
 run configuration are saved in `~/.config/ros2-studio/preferences.json` on Linux
 (or under `XDG_CONFIG_HOME`). `ROS_STUDIO_SETTINGS_PATH` overrides the path.
 Windows uses `%APPDATA%`; macOS uses `~/Library/Application Support`.
@@ -215,6 +314,11 @@ Preferences are replaced atomically. A malformed or unsupported file is reported
 and left untouched; the application uses session-only defaults until corrected.
 No external editor configuration is changed. Projects are not automatically
 executed or connected when restoring preferences.
+The last project is remembered only after a successful scan, using its absolute
+canonical path. A missing, moved, or inaccessible folder (including a failed
+startup scan) falls back to the empty page. Its saved path is retained so a
+temporarily disconnected drive can be reopened on a later launch. Older
+preferences without this field keep the empty startup page.
 
 ## Independent source workspace
 

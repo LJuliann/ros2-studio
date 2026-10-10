@@ -112,6 +112,7 @@ pub struct Execution {
 pub enum RunTarget {
     Node(String),
     File(String),
+    Make(crate::makefile::MakeTarget),
 }
 
 impl RunTarget {
@@ -127,6 +128,7 @@ impl RunTarget {
         match self {
             Self::Node(id) => node_execution(project, id, operation),
             Self::File(path) => source_execution(project, path, operation),
+            Self::Make(target) => target.execution(Path::new(&project.root_path), operation),
         }
     }
 }
@@ -254,54 +256,9 @@ fn cargo_binary_for_source(
     document: &toml::Value,
     path: &Path,
 ) -> Result<Option<String>> {
-    let mut binaries = Vec::<(String, std::path::PathBuf)>::new();
-    if let Some(entries) = document.get("bin").and_then(toml::Value::as_array) {
-        for entry in entries {
-            if let (Some(name), Some(source)) = (
-                entry.get("name").and_then(toml::Value::as_str),
-                entry.get("path").and_then(toml::Value::as_str),
-            ) {
-                binaries.push((name.into(), package_root.join(source)));
-            }
-        }
-    }
-    if document
-        .get("package")
-        .and_then(|package| package.get("autobins"))
-        .and_then(toml::Value::as_bool)
-        != Some(false)
-    {
-        if let Some(name) = document
-            .get("package")
-            .and_then(|package| package.get("name"))
-            .and_then(toml::Value::as_str)
-        {
-            binaries.push((name.into(), package_root.join("src/main.rs")));
-        }
-        let relative = path.strip_prefix(package_root)?;
-        let name = if relative.parent() == Some(Path::new("src/bin")) {
-            path.file_stem()
-        } else if path.file_name().is_some_and(|name| name == "main.rs") {
-            relative
-                .parent()
-                .filter(|directory| directory.parent() == Some(Path::new("src/bin")))
-                .and_then(Path::file_name)
-        } else {
-            None
-        };
-        if let Some(name) = name.and_then(|value| value.to_str()) {
-            binaries.push((name.into(), path.to_path_buf()));
-        }
-    }
-    for (name, candidate) in binaries {
-        match candidate.canonicalize() {
-            Ok(source) if source == path => return Ok(Some(name)),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("Cannot resolve Cargo binary source"),
-        }
-    }
-    Ok(None)
+    let targets =
+        ros_studio_scan::cargo::binary_targets(package_root, &toml::to_string(document)?)?;
+    Ok(ros_studio_scan::cargo::binary_for_source(&targets, path).map(str::to_owned))
 }
 
 pub fn node_execution(
@@ -350,6 +307,34 @@ pub fn node_execution(
             manifest.starts_with(&root),
             "Manifest is outside the project"
         );
+        let targets = ros_studio_scan::cargo::binary_targets(
+            &package_root,
+            &std::fs::read_to_string(&manifest)?,
+        )?;
+        let mut source_binary = None;
+        for location in node
+            .source_locations
+            .iter()
+            .filter(|location| location.path.ends_with(".rs"))
+        {
+            let source = root.join(&location.path).canonicalize()?;
+            ensure!(source.starts_with(&root), "Source is outside the project");
+            if let Some(binary) = ros_studio_scan::cargo::binary_for_source(&targets, &source) {
+                ensure!(
+                    source_binary.is_none_or(|previous| previous == binary),
+                    "Node belongs to several Cargo binaries"
+                );
+                source_binary = Some(binary);
+            }
+        }
+        let binary = source_binary
+            .or_else(|| {
+                targets
+                    .iter()
+                    .find(|target| target.name == node.executable)
+                    .map(|target| target.name.as_str())
+            })
+            .context("Cannot identify this node's Cargo binary; choose its binary source file")?;
         vec![
             "cargo".into(),
             match operation {
@@ -360,7 +345,7 @@ pub fn node_execution(
             "--manifest-path".into(),
             manifest.strip_prefix(&root)?.to_string_lossy().into_owned(),
             "--bin".into(),
-            node.executable.clone(),
+            binary.into(),
         ]
     } else if operation == Operation::Build {
         let mut command = vec![
@@ -492,6 +477,10 @@ mod tests {
         for configured in [
             RunTarget::Node("node:detector".into()),
             RunTarget::File("test.py".into()),
+            RunTarget::Make(crate::makefile::MakeTarget {
+                makefile: "Makefile".into(),
+                target: "ros-run".into(),
+            }),
         ] {
             assert_eq!(
                 RunTarget::for_selection(Some("node:camera"), Some(&configured)),
@@ -505,6 +494,10 @@ mod tests {
         for configured in [
             RunTarget::Node("node:camera".into()),
             RunTarget::File("test.py".into()),
+            RunTarget::Make(crate::makefile::MakeTarget {
+                makefile: "Makefile".into(),
+                target: "ros-run".into(),
+            }),
         ] {
             assert_eq!(
                 RunTarget::for_selection(None, Some(&configured)),
@@ -549,7 +542,7 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("src/bin"))?;
         std::fs::write(
             directory.path().join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n[[bin]]\nname='bridge'\npath='src/bridge.rs'\n",
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n[[bin]]\nname='bridge'\npath='src/bridge.rs'\n",
         )?;
         for source in [
             "src/main.rs",
@@ -585,6 +578,48 @@ mod tests {
                 .map(String::as_str),
             Some("check")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_and_source_commands_use_cargo_names_instead_of_ros_package_names() -> Result<()> {
+        for (source, bins, expected) in [
+            ("src/main.rs", "", "cargo_name"),
+            (
+                "src/entry.rs",
+                "[[bin]]\nname='explicit_name'\npath='src/entry.rs'\n",
+                "explicit_name",
+            ),
+            ("src/bin/directory/main.rs", "", "directory"),
+        ] {
+            let root = tempfile::tempdir()?;
+            let package = root.path().join("src/ros_name");
+            let path = package.join(source);
+            std::fs::create_dir_all(path.parent().context("Missing parent")?)?;
+            std::fs::write(
+                package.join("package.xml"),
+                "<package><name>ros_name</name></package>",
+            )?;
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='cargo_name'\nversion='0.1.0'\nedition='2024'\n{bins}"),
+            )?;
+            std::fs::write(
+                path,
+                "fn main() { let node = executor.create_node(\"camera\")?; }",
+            )?;
+            let project = GraphSnapshot::scan(root.path())?.project;
+            let node = project.nodes.first().context("Missing node")?;
+            assert_eq!(node.executable, expected);
+            for operation in [Operation::Build, Operation::Run] {
+                let graph_command = node_execution(&project, node.id.as_str(), operation)?.command;
+                let file_command =
+                    source_execution(&project, &format!("src/ros_name/{source}"), operation)?
+                        .command;
+                assert_eq!(graph_command, file_command);
+                assert_eq!(graph_command.last().map(String::as_str), Some(expected));
+            }
+        }
         Ok(())
     }
 

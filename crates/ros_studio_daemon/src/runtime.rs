@@ -4,15 +4,17 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
+        mpsc::{self, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use crate::runtime_health::RuntimeHealth;
 use anyhow::Context as _;
-use rclrs::{Context, CreateBasicExecutor, Node as RclrsNode};
+use rclrs::{Context, CreateBasicExecutor, Node as RclrsNode, SpinOptions};
 use ros_studio_model::{EndpointKind, EntityId};
+use ros_studio_protocol::health::{TopicWatch, validate_watches};
 use ros_studio_protocol::{
     CAPABILITY_UNAVAILABLE, DiagnosticSeverity, Event, EventMessage, INVALID_PARAMS, Request,
     RequestMessage, ResponseMessage, ResponseResult, UNSUPPORTED_PROTOCOL_VERSION,
@@ -24,11 +26,12 @@ use crate::runtime_graph::{
     RuntimeEndpointInfo, RuntimeGraph, RuntimeNodeInfo, project_id_for_workspace,
 };
 
-type SharedOutput = Arc<Mutex<io::Stdout>>;
+type SharedOutput = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct RuntimeWorker {
     running: Arc<AtomicBool>,
     handle: JoinHandle<anyhow::Result<()>>,
+    health_requests: Sender<Vec<TopicWatch>>,
 }
 
 impl RuntimeWorker {
@@ -42,15 +45,58 @@ impl RuntimeWorker {
         let observer_namespace = observer.namespace();
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = running.clone();
+        let (health_requests, health_receiver) = mpsc::channel();
 
         let handle = thread::spawn(move || {
             // Graph queries use the node while its context and executor stay alive.
             let _context = context;
-            let _executor = executor;
+            let mut executor = executor;
+            let mut health = RuntimeHealth::new(project_id.clone());
             let mut graph = RuntimeGraph::new(project_id);
             let mut last_error = None;
+            let mut last_spin_error = None;
+            let mut next_query = Instant::now();
 
             while worker_running.load(Ordering::Acquire) {
+                while let Ok(watches) = health_receiver.try_recv() {
+                    health.configure(&observer, watches)?;
+                    write_message(
+                        &output,
+                        &EventMessage::new(Event::HealthChanged {
+                            report: health.report()?,
+                        }),
+                    )?;
+                }
+                // Arrival callbacks must spin; graph discovery alone does not
+                // receive data. Short bounded spins keep shutdown responsive.
+                let spin_started = Instant::now();
+                let spin_error = executor
+                    .spin(SpinOptions::default().timeout(Duration::from_millis(100)))
+                    .first()
+                    .map(ToString::to_string);
+                if let Some(error) = &spin_error
+                    && last_spin_error.as_ref() != Some(error)
+                {
+                    write_message(
+                        &output,
+                        &EventMessage::new(Event::Diagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            message: format!("ROS observer: {error}"),
+                            source_location: None,
+                        }),
+                    )?;
+                }
+                last_spin_error = spin_error;
+                // An empty executor or an error may return immediately. Avoid
+                // a busy loop when no topics are configured or receiving data.
+                let rest = Duration::from_millis(100).saturating_sub(spin_started.elapsed());
+                if !rest.is_zero() {
+                    thread::sleep(rest);
+                }
+                if Instant::now() < next_query {
+                    continue;
+                }
+                next_query = Instant::now() + Duration::from_secs(1);
                 match query_graph(&observer, &observer_name, &observer_namespace) {
                     Ok((nodes, endpoints)) => {
                         last_error = None;
@@ -79,7 +125,24 @@ impl RuntimeWorker {
                     }
                 }
 
-                thread::sleep(Duration::from_secs(1));
+                if health.configured {
+                    write_message(
+                        &output,
+                        &EventMessage::new(Event::HealthChanged {
+                            report: health.report()?,
+                        }),
+                    )?;
+                }
+            }
+
+            if health.configured {
+                health.configure(&observer, Vec::new())?;
+                write_message(
+                    &output,
+                    &EventMessage::new(Event::HealthChanged {
+                        report: health.report()?,
+                    }),
+                )?;
             }
 
             if let Some(patch) = graph.clear() {
@@ -92,7 +155,11 @@ impl RuntimeWorker {
             Ok(())
         });
 
-        Ok(Self { running, handle })
+        Ok(Self {
+            running,
+            handle,
+            health_requests,
+        })
     }
 
     fn stop(self) -> anyhow::Result<()> {
@@ -104,8 +171,12 @@ impl RuntimeWorker {
 }
 
 pub fn serve_ros_stdio() -> io::Result<()> {
-    let output = Arc::new(Mutex::new(io::stdout()));
-    let (process_event_sender, process_event_receiver) = mpsc::channel();
+    let output: SharedOutput = Arc::new(Mutex::new(Box::new(io::stdout())));
+    serve_ros(io::stdin().lock(), output)
+}
+
+fn serve_ros(reader: impl BufRead, output: SharedOutput) -> io::Result<()> {
+    let (process_event_sender, process_event_receiver) = mpsc::sync_channel(256);
     let process_event_writer = thread::spawn({
         let output = output.clone();
         move || {
@@ -115,57 +186,61 @@ pub fn serve_ros_stdio() -> io::Result<()> {
             io::Result::Ok(())
         }
     });
-    let stdin = io::stdin();
     let mut project_id = None;
     let mut workspace_root = None;
     let mut worker: Option<RuntimeWorker> = None;
     let mut processes = Vec::new();
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        reap_finished_processes(&mut processes).map_err(io::Error::other)?;
-        let (response, process_to_activate) = match serde_json::from_str::<RequestMessage>(&line) {
-            Ok(message) => handle_request(
-                message,
-                &mut project_id,
-                &mut workspace_root,
-                &mut worker,
-                &mut processes,
-                &process_event_sender,
-                &output,
-            ),
-            Err(error) => (crate::malformed_request(&line, &error), None),
-        };
+    let serving = (|| -> io::Result<()> {
+        for line in reader.lines() {
+            let line = line?;
+            reap_finished_processes(&mut processes).map_err(io::Error::other)?;
+            let (response, process_to_activate) =
+                match serde_json::from_str::<RequestMessage>(&line) {
+                    Ok(message) => handle_request(
+                        message,
+                        &mut project_id,
+                        &mut workspace_root,
+                        &mut worker,
+                        &mut processes,
+                        &process_event_sender,
+                        &output,
+                    ),
+                    Err(error) => (crate::malformed_request(&line, &error), None),
+                };
 
-        write_message(&output, &response)?;
-        if let Some(process_id) = process_to_activate {
-            let activation_result = processes
-                .iter()
-                .find(|process| process.id() == process_id)
-                .context("newly launched process is missing")
-                .and_then(ProcessWorker::activate);
-            if let Err(error) = activation_result {
-                process_event_sender
-                    .send(Event::Diagnostic {
-                        severity: DiagnosticSeverity::Error,
-                        message: error.to_string(),
-                        source_location: None,
-                    })
-                    .map_err(io::Error::other)?;
+            write_message(&output, &response)?;
+            if let Some(process_id) = process_to_activate {
+                let activation_result = processes
+                    .iter()
+                    .find(|process| process.id() == process_id)
+                    .context("newly launched process is missing")
+                    .and_then(ProcessWorker::activate);
+                if let Err(error) = activation_result {
+                    process_event_sender
+                        .send(Event::Diagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            message: error.to_string(),
+                            source_location: None,
+                        })
+                        .map_err(io::Error::other)?;
+                }
             }
         }
-    }
 
-    if let Some(worker) = worker {
-        worker
-            .stop()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    }
-    stop_processes(&mut processes).map_err(io::Error::other)?;
+        Ok(())
+    })();
+
+    // Every shutdown step must run even when serving or discovery has failed.
+    let discovery = worker.map(RuntimeWorker::stop).transpose();
+    let processes = stop_processes(&mut processes);
     drop(process_event_sender);
-    process_event_writer
-        .join()
-        .map_err(|_| io::Error::other("process event writer thread panicked"))??;
+    let writer = process_event_writer.join();
+
+    serving?;
+    discovery.map_err(io::Error::other)?;
+    processes.map_err(io::Error::other)?;
+    writer.map_err(|_| io::Error::other("process event writer thread panicked"))??;
 
     Ok(())
 }
@@ -176,7 +251,7 @@ fn handle_request(
     workspace_root: &mut Option<PathBuf>,
     worker: &mut Option<RuntimeWorker>,
     processes: &mut Vec<ProcessWorker>,
-    process_events: &Sender<Event>,
+    process_events: &SyncSender<Event>,
     output: &SharedOutput,
 ) -> (ResponseMessage, Option<String>) {
     if let Err(error) = message.validate() {
@@ -304,6 +379,31 @@ fn handle_request(
                 ResponseMessage::success(message.id, ResponseResult::Accepted {}),
                 None,
             )
+        }
+        Request::ConfigureHealth { topics } => {
+            let result = validate_watches(&topics)
+                .map_err(anyhow::Error::msg)
+                .and_then(|()| {
+                    worker
+                        .as_ref()
+                        .context("Start runtime discovery before monitoring topics")
+                })
+                .and_then(|worker| {
+                    worker
+                        .health_requests
+                        .send(topics)
+                        .context("Health observer stopped")
+                });
+            match result {
+                Ok(()) => (
+                    ResponseMessage::success(message.id, ResponseResult::Accepted {}),
+                    None,
+                ),
+                Err(error) => (
+                    ResponseMessage::error(Some(message.id), INVALID_PARAMS, error.to_string()),
+                    None,
+                ),
+            }
         }
         Request::Launch { command, env } => {
             let Some(workspace_root) = workspace_root.as_deref() else {
@@ -487,7 +587,124 @@ fn write_message(message_output: &SharedOutput, message: &impl Serialize) -> io:
 
 #[cfg(test)]
 mod tests {
-    use super::is_known_ros_node;
+    use super::*;
+
+    struct FailingInput {
+        input: io::Cursor<Vec<u8>>,
+        pid_path: PathBuf,
+    }
+
+    fn wait_for_pid(path: &std::path::Path) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.is_file() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("test child did not start"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    impl io::Read for FailingInput {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+
+    impl BufRead for FailingInput {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+        fn consume(&mut self, count: usize) {
+            self.input.consume(count);
+        }
+        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
+            if self.input.position() as usize == self.input.get_ref().len() {
+                wait_for_pid(&self.pid_path)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected input failure",
+                ));
+            }
+            self.input.read_line(line)
+        }
+    }
+
+    struct FailingOutput {
+        flushes: usize,
+        pid_path: PathBuf,
+    }
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.flushes >= 2 {
+                wait_for_pid(&self.pid_path)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected output failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_and_response_errors_still_stop_launched_processes() -> anyhow::Result<()> {
+        for output_failure in [false, true] {
+            let root = tempfile::tempdir()?;
+            let pid_path = root.path().join("child.pid");
+            let messages = [
+                RequestMessage::new(
+                    1,
+                    Request::OpenWorkspace {
+                        path: root.path().to_string_lossy().into_owned(),
+                    },
+                ),
+                RequestMessage::new(
+                    2,
+                    Request::Launch {
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "echo $$ > child.pid; exec sleep 30".into(),
+                        ],
+                        env: std::collections::BTreeMap::new(),
+                    },
+                ),
+            ];
+            let mut input = Vec::new();
+            for message in messages {
+                serde_json::to_writer(&mut input, &message)?;
+                input.push(b'\n');
+            }
+            let output: Box<dyn Write + Send> = if output_failure {
+                Box::new(FailingOutput {
+                    flushes: 0,
+                    pid_path: pid_path.clone(),
+                })
+            } else {
+                Box::new(io::sink())
+            };
+            let result = serve_ros(
+                FailingInput {
+                    input: io::Cursor::new(input),
+                    pid_path: pid_path.clone(),
+                },
+                Arc::new(Mutex::new(output)),
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            let pid: i32 = std::fs::read_to_string(pid_path)?.trim().parse()?;
+            assert_eq!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn ignores_unresolved_ros_graph_nodes() {

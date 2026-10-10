@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, ensure};
 use async_channel::Receiver;
@@ -10,6 +15,9 @@ use gpui::{
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use ros_studio_app::{
     ExternalEditor, GraphSnapshot, NODE_HEIGHT, NODE_WIDTH, NodePosition, Viewport,
+    health::HealthSnapshot,
+    local_process,
+    makefile::{self, MakeCatalog, MakeTarget},
     preferences::Preferences,
     relevant_project_path,
     runtime::{Execution, GraphMode, Operation, RunTarget, RuntimeOverlay},
@@ -22,6 +30,10 @@ use walkdir::WalkDir;
 
 use crate::console_view::{Closed, ConsoleView};
 use crate::node_wizard::{NodeWizard, WizardEvent};
+use crate::text_input::{Changed, TextInput};
+use crate::theme;
+
+mod health_view;
 
 enum WatchEvent {
     Changed,
@@ -35,6 +47,7 @@ enum InspectorView {
     Packages,
     Nodes,
     Topics,
+    Health,
 }
 
 #[derive(Clone)]
@@ -56,13 +69,14 @@ enum Drag {
 
 pub struct GraphView {
     root: Option<PathBuf>,
+    restoring_project: bool,
     snapshot: Option<GraphSnapshot>,
     selected_node: Option<String>,
     editor: ExternalEditor,
     show_editors: bool,
     viewport: Viewport,
     canvas_bounds: Option<Bounds<Pixels>>,
-    fit_pending: bool,
+    initial_view_pending: bool,
     drag: Option<Drag>,
     status: String,
     error: Option<String>,
@@ -74,10 +88,26 @@ pub struct GraphView {
     wizard_subscription: Option<gpui::Subscription>,
     design_project: Option<Project>,
     overlay: RuntimeOverlay,
+    health_snapshot: HealthSnapshot,
+    health_error: Option<String>,
+    health_settings_error: Option<String>,
+    health_topic: Option<(String, String)>,
+    health_hz: gpui::Entity<TextInput>,
+    health_timeout: gpui::Entity<TextInput>,
+    _health_input_subscriptions: [gpui::Subscription; 2],
+    _health_tick_task: Task<()>,
     mode: GraphMode,
     positions: BTreeMap<String, NodePosition>,
     preference: RuntimePreference,
     connection: Option<SessionHandle>,
+    local_connection: Option<SessionHandle>,
+    local_task: Option<Task<()>>,
+    make_catalog: MakeCatalog,
+    expanded_make_groups: BTreeSet<Option<String>>,
+    show_make_panel: bool,
+    make_filter: gpui::Entity<TextInput>,
+    _make_filter_subscription: gpui::Subscription,
+    running_make: Option<MakeTarget>,
     runtime_task: Option<Task<()>>,
     runtime_workers: Vec<Task<()>>,
     closing: bool,
@@ -111,14 +141,50 @@ impl GraphView {
         initial_error: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let restoring_project = root.is_none();
+        let root = preferences.startup_project(root);
+        let restoring_project = restoring_project && root.is_some();
         let console = cx.new(ConsoleView::new);
         let console_subscription = cx.subscribe(&console, |this, _, _: &Closed, cx| {
             this.console_visible = false;
             cx.notify();
         });
+        let make_filter = cx.new(|cx| TextInput::new("Search Make commands…", false, cx));
+        let make_filter_subscription =
+            cx.subscribe(&make_filter, |_, _, _: &Changed, cx| cx.notify());
+        let health_hz = cx.new(|cx| TextInput::new("Expected Hz", false, cx));
+        let health_timeout = cx.new(|cx| TextInput::new("Silence timeout (seconds)", false, cx));
+        let health_input_subscriptions = [
+            cx.subscribe(&health_hz, |_, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe(&health_timeout, |_, _, _: &Changed, cx| cx.notify()),
+        ];
+        let health_tick_task = cx.spawn(async move |this, cx| {
+            loop {
+                async_io::Timer::after(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.discovery
+                            && this.health_error.is_none()
+                            && this.health_snapshot.is_stale(Instant::now())
+                        {
+                            this.health_error = Some(
+                                "Health observer stopped reporting; measurements are unknown"
+                                    .into(),
+                            );
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let quit_subscription = cx.on_app_quit(|this, _| {
             this.connection = None;
             this.runtime_task = None;
+            this.local_connection = None;
+            this.local_task = None;
             let workers = std::mem::take(&mut this.runtime_workers);
             async move {
                 futures::future::join_all(workers).await;
@@ -126,13 +192,14 @@ impl GraphView {
         });
         let mut view = Self {
             root,
+            restoring_project,
             snapshot: None,
             selected_node: None,
             editor: preferences.editor,
             show_editors: false,
             viewport: Viewport::default(),
             canvas_bounds: None,
-            fit_pending: true,
+            initial_view_pending: true,
             drag: None,
             status: "Open a ROS project folder to begin".to_owned(),
             error: None,
@@ -144,10 +211,26 @@ impl GraphView {
             wizard_subscription: None,
             design_project: None,
             overlay: RuntimeOverlay::default(),
+            health_snapshot: HealthSnapshot::default(),
+            health_error: None,
+            health_settings_error: None,
+            health_topic: None,
+            health_hz,
+            health_timeout,
+            _health_input_subscriptions: health_input_subscriptions,
+            _health_tick_task: health_tick_task,
             mode: GraphMode::Design,
             positions: BTreeMap::new(),
             preference: preferences.environment,
             connection: None,
+            local_connection: None,
+            local_task: None,
+            make_catalog: MakeCatalog::default(),
+            expanded_make_groups: BTreeSet::new(),
+            show_make_panel: false,
+            make_filter,
+            _make_filter_subscription: make_filter_subscription,
+            running_make: None,
             runtime_task: None,
             runtime_workers: Vec::new(),
             closing: false,
@@ -190,6 +273,8 @@ impl GraphView {
         self.closing = true;
         self.connection = None;
         self.runtime_task = None;
+        self.local_connection = None;
+        self.local_task = None;
         let workers = std::mem::take(&mut self.runtime_workers);
         cx.spawn_in(window, async move |_, cx| {
             futures::future::join_all(workers).await;
@@ -215,10 +300,10 @@ impl GraphView {
     }
 
     fn set_configuration(&mut self, target: RunTarget, cx: &mut Context<Self>) {
-        // Choosing a file must not leave a highlighted node overriding it.
+        // Explicit file/make configurations must not be overridden by an old node selection.
         self.selected_node = match &target {
             RunTarget::Node(id) => Some(id.clone()),
-            RunTarget::File(_) => None,
+            RunTarget::File(_) | RunTarget::Make(_) => None,
         };
         if let Some(project) = &self.design_project {
             self.preferences
@@ -296,6 +381,15 @@ impl GraphView {
                     .context("Folder chooser was closed unexpectedly")??;
                 if let Some(root) = selected.and_then(|paths| paths.into_iter().next()) {
                     this.update(cx, |this, cx| {
+                        this.local_connection = None;
+                        this.local_task = None;
+                        this.health_topic = None;
+                        this.health_settings_error = None;
+                        this.make_catalog = MakeCatalog::default();
+                        this.expanded_make_groups.clear();
+                        this.show_make_panel = false;
+                        this.running_make = None;
+                        this.make_filter.update(cx, |input, cx| input.clear(cx));
                         this.disconnect(cx);
                         this.design_project = None;
                         this.positions.clear();
@@ -310,7 +404,8 @@ impl GraphView {
                         this.inspector_view = InspectorView::Selection;
                         this.drag = None;
                         this.root = Some(root);
-                        this.fit_pending = true;
+                        this.restoring_project = false;
+                        this.initial_view_pending = true;
                         this.viewport = Viewport::default();
                         this.refresh(cx);
                     })?;
@@ -365,15 +460,49 @@ impl GraphView {
         self.status = "Scanning project…".to_owned();
         let scan = cx.background_spawn(async move {
             let snapshot = GraphSnapshot::scan(&root)?;
+            let make_targets = makefile::catalog(&snapshot.root, &snapshot.project);
             let watcher = watch_project(&snapshot.root);
-            anyhow::Ok((snapshot, watcher))
+            anyhow::Ok((snapshot, watcher, make_targets))
         });
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let result = scan.await;
             if let Err(error) = this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok((snapshot, watcher)) => this.apply_snapshot(snapshot, watcher, cx),
+                    Ok((snapshot, watcher, make_targets)) => {
+                        this.restoring_project = false;
+                        let first_scan = this.design_project.is_none();
+                        if first_scan {
+                            this.show_make_panel = make_targets
+                                .as_ref()
+                                .is_ok_and(|catalog| !catalog.targets.is_empty());
+                            // Frame after the sidebar has taken its actual width, not
+                            // against the previous project's canvas bounds.
+                            this.canvas_bounds = None;
+                            this.initial_view_pending = true;
+                        }
+                        this.apply_snapshot(snapshot, watcher, cx);
+                        match make_targets {
+                            Ok(catalog) => {
+                                this.make_catalog = catalog;
+                            }
+                            Err(error) => {
+                                this.make_catalog = MakeCatalog::default();
+                                this.error =
+                                    Some(format!("Makefile discovery unavailable: {error:#}"));
+                            }
+                        }
+                    }
+                    Err(error) if this.restoring_project => {
+                        // The folder can disappear after the startup accessibility
+                        // check, or scanning can encounter unreadable files. Keep
+                        // the saved path for a later launch, but show the normal
+                        // empty page rather than a broken restored session.
+                        eprintln!("Cannot restore the last project: {error:#}");
+                        this.restoring_project = false;
+                        this.root = None;
+                        this.status = "Open a ROS project folder to begin".into();
+                    }
                     Err(error) => this.show_error(error, cx),
                 }
                 cx.notify();
@@ -396,6 +525,10 @@ impl GraphView {
             "Drag to pan · Scroll to zoom · Double-click a source node to open its code".to_owned()
         };
         self.root = Some(snapshot.root.clone());
+        if self.preferences.last_project != self.root {
+            self.preferences.last_project = self.root.clone();
+            self.save_preferences(cx);
+        }
         if self.design_project.is_none() {
             self.run_target = self
                 .preferences
@@ -417,8 +550,8 @@ impl GraphView {
                 self.error = Some(format!("Auto-refresh unavailable: {error:#}. Use Refresh."));
             }
         }
-        if self.fit_pending {
-            self.fit(cx);
+        if self.initial_view_pending {
+            self.frame_project(cx);
         }
     }
 
@@ -443,11 +576,11 @@ impl GraphView {
             .is_none_or(|previous| previous.project.nodes.is_empty())
             && !snapshot.project.nodes.is_empty()
         {
-            self.fit_pending = true;
+            self.initial_view_pending = true;
         }
         self.snapshot = Some(snapshot);
-        if self.fit_pending {
-            self.fit(cx);
+        if self.initial_view_pending {
+            self.frame_project(cx);
         }
         cx.notify();
     }
@@ -508,12 +641,16 @@ impl GraphView {
         self.runtime_task = None;
         self.ready = false;
         self.discovery = false;
-        self.active = None;
         self.queued = None;
-        self.launch_pending = false;
-        self.stopping = false;
+        if self.local_connection.is_none() {
+            self.active = None;
+            self.launch_pending = false;
+            self.stopping = false;
+        }
         self.connection_label = "Disconnected".into();
         self.overlay = RuntimeOverlay::default();
+        self.health_snapshot = HealthSnapshot::default();
+        self.health_error = None;
         if self.auto_mode {
             self.mode = GraphMode::Design;
         }
@@ -522,6 +659,23 @@ impl GraphView {
 
     fn runtime_message(&mut self, event: RuntimeMessage, cx: &mut Context<Self>) {
         match event {
+            RuntimeMessage::Health(report) => {
+                if let Some(design) = &self.design_project {
+                    let watches = self.health_watches().to_vec();
+                    if self
+                        .health_snapshot
+                        .apply(report, &design.id, &watches, Instant::now())
+                    {
+                        self.health_error = None;
+                    }
+                }
+            }
+            RuntimeMessage::HealthUnavailable(message) => {
+                self.health_snapshot = HealthSnapshot::default();
+                self.health_error = Some(format!(
+                    "Health unavailable: {message}. Rebuild the ROS daemon if needed."
+                ));
+            }
             RuntimeMessage::Environment(label) => {
                 self.connection_label = format!("{label} · connecting…");
                 self.log(&format!("{label}\n"), OutputStream::Stdout, cx);
@@ -536,6 +690,9 @@ impl GraphView {
                     "Connected · discovery unavailable"
                 }
                 .into();
+                if discovery && !self.health_watches().is_empty() {
+                    self.sync_health(cx);
+                }
                 if let Some(execution) = self.queued.take() {
                     self.send_execution(execution, cx);
                 }
@@ -605,11 +762,15 @@ impl GraphView {
                 self.connection = None;
                 self.ready = false;
                 self.discovery = false;
-                self.active = None;
                 self.queued = None;
-                self.launch_pending = false;
-                self.stopping = false;
+                if self.local_connection.is_none() {
+                    self.active = None;
+                    self.launch_pending = false;
+                    self.stopping = false;
+                }
                 self.overlay = RuntimeOverlay::default();
+                self.health_snapshot = HealthSnapshot::default();
+                self.health_error = None;
                 self.connection_label = "Disconnected".into();
                 if self.auto_mode {
                     self.mode = GraphMode::Design;
@@ -636,10 +797,30 @@ impl GraphView {
             RunTarget::for_selection(self.selected_node.as_deref(), self.run_target.as_ref())
         else {
             self.show_configurations = true;
-            self.status = "Choose a ROS node or source file, then Build/Run".into();
+            self.status =
+                "Choose a ROS node, source file, or Makefile target, then Build/Run".into();
             cx.notify();
             return;
         };
+        self.launch_target(target, operation, true, cx);
+    }
+
+    /// The Make panel launches its explicit target, independent of node selection
+    /// and without changing the user's Build/Run configuration.
+    fn launch_target(
+        &mut self,
+        target: RunTarget,
+        operation: Operation,
+        remember_configuration: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active.is_some() || self.launch_pending {
+            self.show_error(
+                anyhow::anyhow!("Stop the current process before launching another"),
+                cx,
+            );
+            return;
+        }
         let result = self
             .design_project
             .as_ref()
@@ -647,13 +828,19 @@ impl GraphView {
             .and_then(|project| target.execution(project, operation));
         match result {
             Ok(execution) => {
-                if self.run_target.as_ref() != Some(&target) {
-                    self.set_configuration(target, cx);
+                let local = matches!(target, RunTarget::Make(_));
+                if remember_configuration && self.run_target.as_ref() != Some(&target) {
+                    self.set_configuration(target.clone(), cx);
                 }
                 self.console_visible = true;
                 self.error = None;
                 self.launch_pending = true;
-                if self.ready {
+                if local {
+                    if let RunTarget::Make(target) = target {
+                        self.running_make = Some(target);
+                    }
+                    self.launch_local(execution, cx);
+                } else if self.ready {
                     self.send_execution(execution, cx);
                 } else {
                     self.queued = Some(execution);
@@ -663,6 +850,60 @@ impl GraphView {
             Err(error) => self.show_error(error, cx),
         }
         cx.notify();
+    }
+
+    fn launch_local(&mut self, execution: Execution, cx: &mut Context<Self>) {
+        let Some(project) = &self.design_project else {
+            return;
+        };
+        let root = PathBuf::from(&project.root_path);
+        self.log(
+            &format!("\n{}\nCommand: {:?}\n", execution.label, execution.command),
+            OutputStream::Stdout,
+            cx,
+        );
+        let (sender, events) = async_channel::bounded(256);
+        let (command_sender, commands) = async_channel::unbounded();
+        self.local_connection = Some(SessionHandle::new(command_sender));
+        self.runtime_workers.push(cx.background_spawn(async move {
+            local_process::run(root, execution, commands, sender).await;
+        }));
+        self.local_task = Some(cx.spawn(async move |this, cx| {
+            while let Ok(first) = events.recv().await {
+                let mut batch = vec![first];
+                while batch.len() < 128 {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(_) => break,
+                    }
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        for event in batch {
+                            if matches!(
+                                event,
+                                RuntimeMessage::Exited { .. } | RuntimeMessage::Failed { .. }
+                            ) {
+                                this.local_connection = None;
+                                this.running_make = None;
+                                if matches!(event, RuntimeMessage::Failed { .. }) {
+                                    this.active = None;
+                                    if this.auto_mode {
+                                        this.mode = GraphMode::Design;
+                                        this.rebuild_graph(cx);
+                                    }
+                                }
+                            }
+                            this.runtime_message(event, cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     fn send_execution(&mut self, execution: Execution, cx: &mut Context<Self>) {
@@ -687,6 +928,16 @@ impl GraphView {
             return;
         }
         if self.launch_pending {
+            if let Some(connection) = &self.local_connection {
+                if let Err(error) = connection.send(ClientCommand::Shutdown) {
+                    self.show_error(error, cx);
+                } else {
+                    self.stopping = true;
+                    self.log("Stopping host task…\n", OutputStream::Stdout, cx);
+                }
+                cx.notify();
+                return;
+            }
             self.disconnect(cx);
             self.log(
                 "Pending launch cancelled; closing runtime session.\n",
@@ -699,9 +950,10 @@ impl GraphView {
             return;
         };
         let result = self
-            .connection
+            .local_connection
             .as_ref()
-            .context("ROS runtime is disconnected")
+            .or(self.connection.as_ref())
+            .context("Process session is disconnected")
             .and_then(|connection| connection.send(ClientCommand::Stop(id.clone())));
         match result {
             Ok(()) => {
@@ -713,107 +965,17 @@ impl GraphView {
         cx.notify();
     }
 
-    fn runtime_toolbar(&self, cx: &mut Context<Self>) -> Div {
+    /// Keep execution controls together, independent of graph/view settings.
+    fn execution_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let running = self.active.is_some() || self.launch_pending;
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .pb_3()
-            .children(
-                [GraphMode::Design, GraphMode::Live, GraphMode::Both]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, mode)| {
-                        button(("mode", index), mode.label())
-                            .when(self.mode == mode, |button| button.bg(rgb(0x425c7f)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode = mode;
-                                this.rebuild_graph(cx);
-                                if mode != GraphMode::Design && this.connection.is_none() {
-                                    this.connect_runtime(cx);
-                                }
-                            }))
-                    }),
-            )
+        toolbar_group()
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .text_color(rgb(0xabb5c5))
-                    .child(self.connection_label.clone()),
-            )
-            .child(
-                button(
-                    "runtime-environment",
-                    format!("Environment: {}", self.preference.label()),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.connection.is_some() {
-                        this.show_error(
-                            anyhow::anyhow!("Disconnect before changing the runtime environment"),
-                            cx,
-                        );
-                    } else {
-                        this.preference = match this.preference {
-                            RuntimePreference::Auto => RuntimePreference::Host,
-                            RuntimePreference::Host => RuntimePreference::Docker,
-                            RuntimePreference::Docker => RuntimePreference::Auto,
-                        };
-                        this.error = None;
-                        this.save_preferences(cx);
-                        cx.notify();
-                    }
-                })),
-            )
-            .child(
-                button(
-                    "runtime-connect",
-                    if self.connection.is_some() {
-                        "Disconnect"
-                    } else {
-                        "Connect"
-                    },
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.connection.is_some() {
-                        this.disconnect(cx);
-                        this.log(
-                            "Runtime session closing; its processes will be stopped.\n",
-                            OutputStream::Stdout,
-                            cx,
-                        );
-                    } else {
-                        this.connect_runtime(cx);
-                    }
-                })),
-            )
-            .child(
-                button(
-                    "runtime-auto-mode",
-                    if self.auto_mode {
-                        "Auto mode: on"
-                    } else {
-                        "Auto mode: off"
-                    },
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.auto_mode = !this.auto_mode;
-                    this.save_preferences(cx);
-                    cx.notify();
-                })),
-            )
-            .child(
-                button("runtime-configurations", "Configuration…").on_click(cx.listener(
-                    |this, _, _, cx| {
+                button("runtime-configurations", "Configuration…")
+                    .when(self.show_configurations, selected_button)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.show_configurations = !this.show_configurations;
                         cx.notify();
-                    },
-                )),
+                    })),
             )
             .child(
                 button("runtime-build", "Build")
@@ -822,6 +984,9 @@ impl GraphView {
             )
             .child(
                 button("runtime-run", "Run")
+                    .bg(rgb(theme::SUCCESS_BACKGROUND))
+                    .text_color(rgb(theme::SUCCESS))
+                    .hover(|button| button.bg(rgb(theme::SUCCESS_HOVER)))
                     .when(running, |button| button.opacity(0.5))
                     .on_click(cx.listener(|this, _, _, cx| this.launch(Operation::Run, cx))),
             )
@@ -830,14 +995,423 @@ impl GraphView {
                     "runtime-stop",
                     if self.stopping { "Stopping…" } else { "Stop" },
                 )
+                .bg(rgb(theme::ERROR_BACKGROUND))
+                .text_color(rgb(theme::ERROR))
+                .hover(|button| button.bg(rgb(theme::ERROR_HOVER)))
                 .when(!running, |button| button.opacity(0.5))
                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
             )
+    }
+
+    fn runtime_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let health_alerts = if self.discovery {
+            self.health_watches()
+                .iter()
+                .filter(|watch| {
+                    self.health_snapshot
+                        .get(&watch.topic, Instant::now())
+                        .is_some_and(|report| {
+                            matches!(
+                                report.state,
+                                ros_studio_protocol::health::TopicHealthState::Missing
+                                    | ros_studio_protocol::health::TopicHealthState::Degraded
+                            )
+                        })
+                })
+                .count()
+        } else {
+            0
+        };
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .flex_shrink_0()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(rgb(theme::SURFACE))
+            .border_t_1()
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
             .child(
-                button("runtime-console", "Console").on_click(cx.listener(|this, _, _, cx| {
-                    this.console_visible = !this.console_visible;
-                    cx.notify();
+                toolbar_group().children(
+                    [GraphMode::Design, GraphMode::Live, GraphMode::Both]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, mode)| {
+                            button(("mode", index), mode.label())
+                                .when(self.mode == mode, selected_button)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mode = mode;
+                                    this.rebuild_graph(cx);
+                                    if mode != GraphMode::Design && this.connection.is_none() {
+                                        this.connect_runtime(cx);
+                                    }
+                                }))
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        button(
+                            "runtime-environment",
+                            format!("Env: {}", self.preference.label()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.connection.is_some() {
+                                this.show_error(
+                                    anyhow::anyhow!(
+                                        "Disconnect before changing the runtime environment"
+                                    ),
+                                    cx,
+                                );
+                            } else {
+                                this.preference = match this.preference {
+                                    RuntimePreference::Auto => RuntimePreference::Host,
+                                    RuntimePreference::Host => RuntimePreference::Docker,
+                                    RuntimePreference::Docker => RuntimePreference::Auto,
+                                };
+                                this.error = None;
+                                this.save_preferences(cx);
+                                cx.notify();
+                            }
+                        })),
+                    )
+                    .child(
+                        button(
+                            "runtime-connect",
+                            if self.connection.is_some() {
+                                "Disconnect"
+                            } else {
+                                "Connect"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.connection.is_some() {
+                                this.disconnect(cx);
+                                this.log(
+                                    "Runtime session closing; its processes will be stopped.\n",
+                                    OutputStream::Stdout,
+                                    cx,
+                                );
+                            } else {
+                                this.connect_runtime(cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        button(
+                            "runtime-auto-mode",
+                            if self.auto_mode {
+                                "Auto: on"
+                            } else {
+                                "Auto: off"
+                            },
+                        )
+                        .when(self.auto_mode, selected_button)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.auto_mode = !this.auto_mode;
+                            this.save_preferences(cx);
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(100.0))
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(theme::MUTED))
+                    .child(self.connection_label.clone()),
+            )
+            .child(
+                toolbar_group()
+                    .child(
+                        button(
+                            "runtime-make-panel",
+                            format!("Make ({})", self.make_catalog.targets.len()),
+                        )
+                        .when(self.show_make_panel, selected_button)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_make_panel = !this.show_make_panel;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        button("runtime-console", "Console")
+                            .when(self.console_visible, selected_button)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.console_visible = !this.console_visible;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button(
+                            "runtime-health",
+                            if health_alerts == 0 {
+                                "Health".to_owned()
+                            } else {
+                                format!("Health · {health_alerts} alerts")
+                            },
+                        )
+                        .when(
+                            self.inspector_view == InspectorView::Health,
+                            selected_button,
+                        )
+                        .when(health_alerts > 0, |button| {
+                            button
+                                .bg(rgb(theme::ERROR_BACKGROUND))
+                                .text_color(rgb(theme::ERROR))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.inspector_view = if this.inspector_view == InspectorView::Health {
+                                InspectorView::Selection
+                            } else {
+                                InspectorView::Health
+                            };
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                toolbar_group()
+                    .child(
+                        button("zoom-out", "−")
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.0 / 1.2, cx))),
+                    )
+                    .child(
+                        button("zoom-in", "+")
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.2, cx))),
+                    )
+                    .child(
+                        button("fit", "Fit graph")
+                            .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
+                    ),
+            )
+    }
+
+    fn make_panel(&self, cx: &mut Context<Self>) -> Div {
+        let busy = self.active.is_some() || self.launch_pending;
+        let query = self.make_filter.read(cx).text().to_owned();
+        let image_index = self
+            .make_catalog
+            .targets
+            .iter()
+            .position(|target| target.target == "image")
+            .filter(|index| self.make_catalog.targets[*index].matches_filter(&query));
+        let groups = self
+            .make_catalog
+            .filtered_groups(&query)
+            .into_iter()
+            .filter_map(|mut group| {
+                group
+                    .target_indices
+                    .retain(|index| self.make_catalog.targets[*index].target != "image");
+                (!group.target_indices.is_empty()).then_some(group)
+            })
+            .collect::<Vec<_>>();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .w(px(320.0))
+            .flex_shrink_0()
+            .bg(rgb(theme::SURFACE))
+            .border_r_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .flex_shrink_0()
+                    .child(div().flex_1().text_lg().child("Make commands"))
+                    .child(button("make-panel-close", "Close").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_make_panel = false;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_3()
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(rgb(theme::MUTED))
+                    .child("Detected from this project · execution on Host"),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pb_3()
+                    .flex_shrink_0()
+                    .child(self.make_filter.clone()),
+            );
+        if let Some(index) = image_index {
+            panel = panel.child(
+                div()
+                    .px_3()
+                    .pb_3()
+                    .flex_shrink_0()
+                    .child(self.make_row(index, busy, cx)),
+            );
+        }
+        if self.make_catalog.targets.is_empty() {
+            panel = panel.child(div().p_3().text_sm().child(if self.loading {
+                "Scanning Makefiles…"
+            } else {
+                "No targets found in the root GNUmakefile, makefile, or Makefile."
+            }));
+        } else if groups.is_empty() && image_index.is_none() {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .child("No Make commands match your search."),
+            );
+        }
+        panel = panel.child(
+            div()
+                .id("make-panel-targets")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_3()
+                .pb_3()
+                .gap_2()
+                .children(groups.into_iter().enumerate().map(|(index, group)| {
+                    // Search exposes matching commands even in collapsed groups.
+                    let collapsed = query.trim().is_empty()
+                        && !self.expanded_make_groups.contains(&group.package);
+                    let label = format!(
+                        "{} {} ({})",
+                        if collapsed { "▸" } else { "▾" },
+                        group.label(),
+                        group.target_indices.len()
+                    );
+                    let key = group.package.clone();
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            button(("make-panel-group", index), label)
+                                .w_full()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.expanded_make_groups.remove(&key) {
+                                        this.expanded_make_groups.insert(key.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .when(!collapsed, |section| {
+                            section.children(
+                                group
+                                    .target_indices
+                                    .into_iter()
+                                    .map(|index| self.make_row(index, busy, cx)),
+                            )
+                        })
                 })),
+        );
+        if self.running_make.is_some() {
+            panel = panel.child(
+                div().p_3().flex_shrink_0().child(
+                    button(
+                        "make-panel-stop",
+                        if self.stopping {
+                            "Stopping…"
+                        } else {
+                            "Stop Make"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                ),
+            );
+        } else if busy {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .flex_shrink_0()
+                    .child("Stop the current process before running a Make command."),
+            );
+        }
+        panel.child(div().p_3().text_xs().flex_shrink_0().text_color(rgb(theme::WARNING))
+            .child("Only run trusted commands: Make recipes can start Docker, multiple nodes, or real hardware. Closing this panel does not stop the task."))
+    }
+
+    fn make_row(&self, index: usize, busy: bool, cx: &mut Context<Self>) -> Div {
+        let target = self.make_catalog.targets[index].clone();
+        let makefile = target.makefile.clone();
+        let running = self.running_make.as_ref() == Some(&target);
+        let label = if target.target == "image" {
+            "make image".to_owned()
+        } else {
+            target.target.clone()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if running {
+                rgb(theme::ACCENT)
+            } else {
+                rgb(theme::BORDER)
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_family("monospace")
+                            .child(label),
+                    )
+                    .child(
+                        button(
+                            ("make-panel-run", index),
+                            if running { "Running" } else { "Run" },
+                        )
+                        .when(busy, |button| button.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.active.is_none() && !this.launch_pending {
+                                this.launch_target(
+                                    RunTarget::Make(target.clone()),
+                                    Operation::Run,
+                                    false,
+                                    cx,
+                                );
+                            }
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::MUTED))
+                    .child(makefile),
             )
     }
 
@@ -847,14 +1421,14 @@ impl GraphView {
             .flex_col()
             .gap_2()
             .p_4()
-            .bg(rgb(0x303947))
+            .bg(rgb(theme::ELEVATED))
             .child(
                 div()
                     .text_lg()
                     .child("Run configuration · Shift+F10 to run · Alt+Shift+F10 to choose"),
             );
         if let Some(project) = &self.design_project {
-            panel = panel.child(
+            panel = panel.child(div().text_sm().child("ROS nodes")).child(
                 div()
                     .id("configuration-list")
                     .max_h(px(220.0))
@@ -872,13 +1446,28 @@ impl GraphView {
                             )
                             .as_ref()
                                 == Some(&target),
-                            |button| button.bg(rgb(0x425c7f)),
+                            |button| button.bg(rgb(theme::SELECTED)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_configuration(target.clone(), cx)
                         }))
                     })),
             );
+        }
+        if !self.make_catalog.targets.is_empty() {
+            panel = panel
+                .child(div().text_sm().child("Makefile targets · run on host · Build/Run executes the chosen target"))
+                .child(div().text_sm().text_color(rgb(theme::WARNING))
+                    .child("Only run trusted targets. Recipes may start Docker, hardware, or multiple nodes."))
+                .child(div().id("configuration-make-list").flex().flex_col()
+                    .max_h(px(180.0)).overflow_y_scroll()
+                    .children(self.make_catalog.targets.iter().enumerate().map(|(index, make)| {
+                        let target = RunTarget::Make(make.clone());
+                        button(("configuration-make", index), format!("make {} · {}", make.target, make.makefile))
+                            .when(RunTarget::for_selection(self.selected_node.as_deref(), self.run_target.as_ref()).as_ref() == Some(&target),
+                                |button| button.bg(rgb(theme::SELECTED)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_configuration(target.clone(), cx)))
+                    })));
         }
         panel.child(
             div()
@@ -902,6 +1491,9 @@ impl GraphView {
     fn configuration_label(&self) -> String {
         match RunTarget::for_selection(self.selected_node.as_deref(), self.run_target.as_ref()) {
             Some(RunTarget::File(path)) => format!("File: {path}"),
+            Some(RunTarget::Make(target)) => {
+                format!("Make: {} · {} (host)", target.target, target.makefile)
+            }
             Some(RunTarget::Node(id)) => self
                 .design_project
                 .as_ref()
@@ -995,6 +1587,24 @@ impl GraphView {
         cx.notify();
     }
 
+    fn frame_project(&mut self, cx: &mut Context<Self>) {
+        if let Some((snapshot, bounds)) = self.snapshot.as_ref().zip(self.canvas_bounds) {
+            if snapshot.positions.is_empty()
+                || bounds.size.width <= px(0.0)
+                || bounds.size.height <= px(0.0)
+            {
+                return;
+            }
+            self.viewport.open_project(
+                &snapshot.positions,
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32(),
+            );
+            self.initial_view_pending = false;
+            cx.notify();
+        }
+    }
+
     fn fit(&mut self, cx: &mut Context<Self>) {
         if let Some((snapshot, bounds)) = self.snapshot.as_ref().zip(self.canvas_bounds) {
             self.viewport.fit(
@@ -1002,7 +1612,7 @@ impl GraphView {
                 bounds.size.width.as_f32(),
                 bounds.size.height.as_f32(),
             );
-            self.fit_pending = false;
+            self.initial_view_pending = false;
             cx.notify();
         }
     }
@@ -1107,6 +1717,9 @@ impl GraphView {
     }
 
     fn inspector(&self, cx: &mut Context<Self>) -> Div {
+        if self.inspector_view == InspectorView::Health {
+            return self.health_panel(cx);
+        }
         let mut panel = div()
             .flex()
             .flex_col()
@@ -1114,7 +1727,9 @@ impl GraphView {
             .p_4()
             .w(px(280.0))
             .flex_shrink_0()
-            .bg(rgb(0x2d333e))
+            .bg(rgb(theme::SURFACE))
+            .border_l_1()
+            .border_color(rgb(theme::BORDER))
             .child(div().text_lg().child("Inspector"));
         if self.inspector_view != InspectorView::Selection {
             panel = panel.child(
@@ -1138,7 +1753,7 @@ impl GraphView {
                                 div()
                                     .py_2()
                                     .border_b_1()
-                                    .border_color(rgb(0x414957))
+                                    .border_color(rgb(theme::BORDER))
                                     .child(package.name.clone())
                                     .child(div().text_xs().child(package.path.clone())),
                             );
@@ -1176,13 +1791,13 @@ impl GraphView {
                                 div()
                                     .py_2()
                                     .border_b_1()
-                                    .border_color(rgb(0x414957))
+                                    .border_color(rgb(theme::BORDER))
                                     .child(name.to_owned())
                                     .child(div().text_xs().child(type_name.to_owned())),
                             );
                         }
                     }
-                    InspectorView::Selection => {}
+                    InspectorView::Selection | InspectorView::Health => {}
                 }
                 return panel.child(list);
             }
@@ -1194,7 +1809,7 @@ impl GraphView {
                 .iter()
                 .find(|node| Some(node.id.as_str()) == self.selected_node.as_deref())
         }) else {
-            return panel.child(div().text_sm().text_color(rgb(0xabb5c5))
+            return panel.child(div().text_sm().text_color(rgb(theme::MUTED))
                 .child("Select a node to inspect its interfaces. Double-click it to open the source in your editor."));
         };
         panel = panel
@@ -1219,7 +1834,12 @@ impl GraphView {
                     }),
                 ),
             )
-            .child(div().text_sm().text_color(rgb(0xabb5c5)).child("SOURCE"));
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::MUTED))
+                    .child("SOURCE"),
+            );
         for (index, source) in node.source_locations.iter().enumerate() {
             let source = source.clone();
             panel = panel.child(
@@ -1234,7 +1854,7 @@ impl GraphView {
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0xabb5c5))
+                    .text_color(rgb(theme::MUTED))
                     .child("INTERFACES"),
             )
             .child(
@@ -1250,18 +1870,18 @@ impl GraphView {
                             .gap_1()
                             .py_2()
                             .border_b_1()
-                            .border_color(rgb(0x414957))
+                            .border_color(rgb(theme::BORDER))
                             .child(format!("{:?} · {}", endpoint.kind, endpoint.name))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0xabb5c5))
+                                    .text_color(rgb(theme::MUTED))
                                     .child(endpoint.type_name.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0xabb5c5))
+                                    .text_color(rgb(theme::MUTED))
                                     .child(format!("Confidence: {:?}", endpoint.confidence)),
                             )
                             .children(endpoint.source_location.as_ref().map(|source| {
@@ -1285,6 +1905,11 @@ impl GraphView {
             .snapshot
             .as_ref()
             .map(|snapshot| {
+                let positions = snapshot
+                    .positions
+                    .iter()
+                    .map(|position| (position.node_id.as_str(), position))
+                    .collect::<BTreeMap<_, _>>();
                 snapshot
                     .edges
                     .iter()
@@ -1292,14 +1917,8 @@ impl GraphView {
                         if edge.publisher_id == edge.subscriber_id {
                             return None;
                         }
-                        let publisher = snapshot
-                            .positions
-                            .iter()
-                            .find(|position| position.node_id == edge.publisher_id)?;
-                        let subscriber = snapshot
-                            .positions
-                            .iter()
-                            .find(|position| position.node_id == edge.subscriber_id)?;
+                        let publisher = positions.get(edge.publisher_id.as_str())?;
+                        let subscriber = positions.get(edge.subscriber_id.as_str())?;
                         let (start, end) = edge_points(publisher, subscriber);
                         Some((start, end, edge.topic.clone()))
                     })
@@ -1314,7 +1933,7 @@ impl GraphView {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(0x242930))
+            .bg(rgb(theme::CANVAS))
             .cursor_grab()
             .on_mouse_down(
                 MouseButton::Right,
@@ -1359,8 +1978,8 @@ impl GraphView {
                     move |bounds, _, cx| {
                         graph_entity.update(cx, |this, cx| {
                             this.canvas_bounds = Some(bounds);
-                            if this.fit_pending {
-                                this.fit(cx);
+                            if this.initial_view_pending {
+                                this.frame_project(cx);
                             }
                         });
                     },
@@ -1374,22 +1993,36 @@ impl GraphView {
             );
         for (index, (start, end, topic)) in lines.iter().enumerate() {
             let (x, y) = viewport.screen_point((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0);
+            let health = (self.discovery && self.mode != GraphMode::Design)
+                .then(|| self.health_snapshot.get(topic, Instant::now()))
+                .flatten();
             graph = graph.child(
                 div()
                     .id(("edge", index))
                     .absolute()
-                    .left(px(x - 100.0))
-                    .top(px(y - 30.0))
-                    .w(px(200.0))
-                    .px_2()
-                    .py_1()
+                    .left(px(x - 100.0 * viewport.scale))
+                    .top(px(y - 30.0 * viewport.scale))
+                    .w(px(200.0 * viewport.scale))
+                    .px(px(8.0 * viewport.scale))
+                    .py(px(4.0 * viewport.scale))
                     .rounded_md()
-                    .bg(rgb(0x303743))
-                    .text_sm()
-                    .text_color(rgb(0x83b9f3))
+                    .bg(rgb(theme::ELEVATED))
+                    .text_size(px(14.0 * viewport.scale))
+                    .text_color(rgb(health.map_or(theme::ACCENT, |report| {
+                        health_view::state_color(report.state)
+                    })))
                     .text_center()
                     .truncate()
-                    .child(topic.clone()),
+                    .child(topic.clone())
+                    .when_some(health, |label, report| {
+                        label.child(div().text_size(px(10.0 * viewport.scale)).child(format!(
+                                "{} · {} Hz",
+                                report.state.label(),
+                                report
+                                    .observed_hz
+                                    .map_or_else(|| "—".into(), |hz| format!("{hz:.1}"))
+                            )))
+                    }),
             );
         }
         if let Some(snapshot) = &self.snapshot {
@@ -1403,6 +2036,16 @@ impl GraphView {
                 };
                 let (x, y) = viewport.screen_point(position.x, position.y);
                 let node_id = node.id.as_str().to_owned();
+                let health = (self.discovery && self.mode != GraphMode::Design)
+                    .then(|| {
+                        self.health_snapshot.node_state(
+                            &snapshot.project,
+                            node,
+                            self.health_watches(),
+                            Instant::now(),
+                        )
+                    })
+                    .flatten();
                 let source = node.source_locations.first().cloned();
                 let package = snapshot
                     .project
@@ -1421,20 +2064,24 @@ impl GraphView {
                         .top(px(y))
                         .w(px(NODE_WIDTH * viewport.scale))
                         .h(px(NODE_HEIGHT * viewport.scale))
-                        .p_3()
+                        .p(px(12.0 * viewport.scale))
                         .flex()
                         .flex_col()
-                        .gap_2()
+                        .gap(px(8.0 * viewport.scale))
                         .rounded_md()
                         .border_1()
                         .overflow_hidden()
                         .cursor_default()
                         .bg(rgb(if self.selected_node.as_deref() == Some(&node_id) {
-                            0x3e4b60
+                            theme::SELECTED
                         } else {
-                            0x303641
+                            theme::SURFACE
                         }))
-                        .border_color(rgb(0x53647a))
+                        .border_color(rgb(if self.selected_node.as_deref() == Some(&node_id) {
+                            theme::ACCENT
+                        } else {
+                            theme::BORDER
+                        }))
                         .text_size(px(14.0 * viewport.scale))
                         .child(
                             div()
@@ -1452,28 +2099,43 @@ impl GraphView {
                                 .child(
                                     div()
                                         .text_size(px(10.0 * viewport.scale))
-                                        .text_color(rgb(0x9baec7))
-                                        .child(match node.runtime_state {
-                                            RuntimeState::Online => "ONLINE",
-                                            RuntimeState::Offline => "OFFLINE",
-                                            RuntimeState::RuntimeOnly => "RUNTIME",
-                                            RuntimeState::Conflict => "CONFLICT",
-                                            RuntimeState::Unknown => "DESIGN",
-                                        }),
+                                        .text_color(rgb(health.map_or_else(
+                                            || match node.runtime_state {
+                                                RuntimeState::Online => theme::SUCCESS,
+                                                RuntimeState::Offline => theme::WARNING,
+                                                RuntimeState::Conflict => theme::ERROR,
+                                                RuntimeState::RuntimeOnly
+                                                | RuntimeState::Unknown => theme::ACCENT,
+                                            },
+                                            health_view::state_color,
+                                        )))
+                                        .child(health.map_or_else(
+                                            || {
+                                                match node.runtime_state {
+                                                    RuntimeState::Online => "ONLINE",
+                                                    RuntimeState::Offline => "OFFLINE",
+                                                    RuntimeState::RuntimeOnly => "RUNTIME",
+                                                    RuntimeState::Conflict => "CONFLICT",
+                                                    RuntimeState::Unknown => "DESIGN",
+                                                }
+                                                .to_owned()
+                                            },
+                                            |state| state.label().to_owned(),
+                                        )),
                                 ),
                         )
                         .child(
                             div()
                                 .truncate()
                                 .text_size(px(11.0 * viewport.scale))
-                                .text_color(rgb(0xabb5c5))
+                                .text_color(rgb(theme::MUTED))
                                 .child(format!("{package} · {}", node.executable)),
                         )
                         .child(
                             div()
                                 .border_t_1()
-                                .border_color(rgb(0x414957))
-                                .pt_2()
+                                .border_color(rgb(theme::BORDER))
+                                .pt(px(8.0 * viewport.scale))
                                 .children(node.endpoints.iter().take(4).map(|endpoint| {
                                     let direction = match endpoint.kind {
                                         ros_studio_model::EndpointKind::Publisher => "OUT",
@@ -1523,7 +2185,7 @@ impl GraphView {
                         .absolute()
                         .top_8()
                         .left_8()
-                        .text_color(rgb(0xabb5c5))
+                        .text_color(rgb(theme::MUTED))
                         .child("No nodes detected in this folder."),
                 );
             }
@@ -1533,7 +2195,7 @@ impl GraphView {
                     .absolute()
                     .top_8()
                     .left_8()
-                    .text_color(rgb(0xabb5c5))
+                    .text_color(rgb(theme::MUTED))
                     .child("Open a ROS project. Your source code stays in your preferred editor."),
             );
         }
@@ -1555,8 +2217,8 @@ impl Render for GraphView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x282e38))
-            .text_color(rgb(0xe0e6ef))
+            .bg(rgb(theme::BACKGROUND))
+            .text_color(rgb(theme::TEXT))
             .font_family("sans-serif")
             .on_mouse_down(
                 MouseButton::Left,
@@ -1581,6 +2243,7 @@ impl Render for GraphView {
                 } else if key.key == "escape" {
                     this.context_menu = None;
                     this.show_configurations = false;
+                    this.show_make_panel = false;
                 } else {
                     return;
                 }
@@ -1595,24 +2258,119 @@ impl Render for GraphView {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .justify_between()
-                    .p_4()
-                    .gap_4()
+                    .px_4()
+                    .py_3()
+                    .gap_3()
+                    .flex_shrink_0()
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .flex_1()
-                            .min_w(px(200.0))
-                            .child(div().text_xl().child("ROS 2 Studio"))
+                            .min_w(px(220.0))
                             .child(
                                 div()
                                     .text_sm()
                                     .truncate()
-                                    .text_color(rgb(0xabb5c5))
+                                    .text_color(rgb(theme::MUTED))
                                     .child(summary),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                button("open-project", "Open project…").on_click(
+                                    cx.listener(|this, _, _, cx| this.choose_project(cx)),
+                                ),
+                            )
+                            .child(
+                                button(
+                                    "refresh",
+                                    if self.loading {
+                                        "Scanning…"
+                                    } else {
+                                        "Refresh"
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        if !this.loading {
+                                            this.refresh(cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .child(
+                                button("new-node", "+ New node")
+                                    .bg(rgb(theme::PRIMARY))
+                                    .hover(|button| button.bg(rgb(theme::PRIMARY_HOVER)))
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.new_node(window, cx)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                button("editor", format!("Editor: {}", self.editor.label()))
+                                    .when(self.show_editors, selected_button)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_editors = !this.show_editors;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(self.execution_toolbar(cx)),
+            )
+            .when(self.show_editors, |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .px_4()
+                        .pb_3()
+                        .items_center()
+                        .child("Open sources with:")
+                        .children(ExternalEditor::ALL.into_iter().enumerate().map(
+                            |(index, editor)| {
+                                button(("editor-choice", index), editor.label())
+                                    .when(editor == self.editor, |button| {
+                                        button.bg(rgb(theme::SELECTED))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.editor = editor;
+                                        this.show_editors = false;
+                                        this.error = None;
+                                        this.save_preferences(cx);
+                                        cx.notify();
+                                    }))
+                            },
+                        )),
+                )
+            })
+            .child(self.runtime_toolbar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .px_4()
+                    .py_1()
+                    .text_xs()
+                    .bg(rgb(theme::SURFACE))
+                    .text_color(rgb(theme::MUTED))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.0))
+                            .truncate()
+                            .child(self.configuration_label()),
                     )
                     .child(
                         div().flex().gap_1().children(
@@ -1620,9 +2378,9 @@ impl Render for GraphView {
                                 (
                                     format!(
                                         "{} packages",
-                                        self.snapshot
-                                            .as_ref()
-                                            .map_or(0, |snapshot| snapshot.project.packages.len())
+                                        self.snapshot.as_ref().map_or(0, |snapshot| {
+                                            snapshot.project.packages.len()
+                                        })
                                     ),
                                     InspectorView::Packages,
                                 ),
@@ -1631,7 +2389,7 @@ impl Render for GraphView {
                                         "{} nodes",
                                         self.snapshot
                                             .as_ref()
-                                            .map_or(0, |snapshot| snapshot.project.nodes.len())
+                                            .map_or(0, |snapshot| { snapshot.project.nodes.len() })
                                     ),
                                     InspectorView::Nodes,
                                 ),
@@ -1648,91 +2406,20 @@ impl Render for GraphView {
                             .into_iter()
                             .enumerate()
                             .map(|(index, (label, view))| {
-                                button(("inspector-summary", index), label).on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                button(("inspector-summary", index), label)
+                                    .px_2()
+                                    .py_0()
+                                    .min_h(px(24.0))
+                                    .text_xs()
+                                    .text_color(rgb(theme::MUTED))
+                                    .when(self.inspector_view == view, selected_button)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.inspector_view = view;
                                         cx.notify();
-                                    },
-                                ))
-                            }),
-                        ),
-                    )
-                    .child(
-                        button("zoom-out", "−")
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.0 / 1.2, cx))),
-                    )
-                    .child(
-                        button("zoom-in", "+")
-                            .on_click(cx.listener(|this, _, _, cx| this.zoom_by(1.2, cx))),
-                    )
-                    .child(
-                        button("open-project", "Open project…")
-                            .on_click(cx.listener(|this, _, _, cx| this.choose_project(cx))),
-                    )
-                    .child(
-                        button(
-                            "refresh",
-                            if self.loading {
-                                "Scanning…"
-                            } else {
-                                "Refresh"
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.loading {
-                                this.refresh(cx);
-                            }
-                        })),
-                    )
-                    .child(
-                        button("new-node", "New node…")
-                            .on_click(cx.listener(|this, _, window, cx| this.new_node(window, cx))),
-                    )
-                    .child(
-                        button("fit", "Fit graph")
-                            .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
-                    )
-                    .child(
-                        button("editor", format!("Editor: {}", self.editor.label())).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.show_editors = !this.show_editors;
-                                cx.notify();
+                                    }))
                             }),
                         ),
                     ),
-            )
-            .when(self.show_editors, |view| {
-                view.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .px_4()
-                        .pb_3()
-                        .items_center()
-                        .child("Open sources with:")
-                        .children(ExternalEditor::ALL.into_iter().enumerate().map(
-                            |(index, editor)| {
-                                button(("editor-choice", index), editor.label())
-                                    .when(editor == self.editor, |button| button.bg(rgb(0x425c7f)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.editor = editor;
-                                        this.show_editors = false;
-                                        this.error = None;
-                                        this.save_preferences(cx);
-                                        cx.notify();
-                                    }))
-                            },
-                        )),
-                )
-            })
-            .child(self.runtime_toolbar(cx))
-            .child(
-                div()
-                    .px_4()
-                    .pb_2()
-                    .text_sm()
-                    .text_color(rgb(0xabb5c5))
-                    .child(self.configuration_label()),
             )
             .when(self.show_configurations, |view| {
                 view.child(self.configuration_picker(cx))
@@ -1742,6 +2429,7 @@ impl Render for GraphView {
                     .flex()
                     .flex_1()
                     .min_h_0()
+                    .when(self.show_make_panel, |view| view.child(self.make_panel(cx)))
                     .child(self.graph_canvas(cx))
                     .child(self.inspector(cx)),
             )
@@ -1760,7 +2448,7 @@ impl Render for GraphView {
                                 .h(px(6.0))
                                 .flex_shrink_0()
                                 .w_full()
-                                .bg(rgb(0x455166))
+                                .bg(rgb(theme::BORDER))
                                 .cursor(gpui::CursorStyle::ResizeUpDown)
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1780,8 +2468,10 @@ impl Render for GraphView {
                 div()
                     .px_4()
                     .py_2()
-                    .text_sm()
-                    .text_color(rgb(0xabb5c5))
+                    .text_xs()
+                    .border_t_1()
+                    .border_color(rgb(theme::BORDER))
+                    .text_color(rgb(theme::MUTED))
                     .child(format!(
                         "{} · {:.0}%",
                         self.status,
@@ -1789,7 +2479,14 @@ impl Render for GraphView {
                     )),
             )
             .when_some(self.error.clone(), |view, error| {
-                view.child(div().px_4().py_2().bg(rgb(0x56353a)).text_sm().child(error))
+                view.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .bg(rgb(theme::ERROR_BACKGROUND))
+                        .text_sm()
+                        .child(error),
+                )
             })
             .when_some(self.wizard.clone(), |view, wizard| {
                 view.child(
@@ -1817,7 +2514,7 @@ impl Render for GraphView {
                         .top(position.y)
                         .w(px(230.0))
                         .occlude()
-                        .bg(rgb(0x303947))
+                        .bg(rgb(theme::ELEVATED))
                         .rounded_md()
                         .p_2()
                         .flex()
@@ -1880,13 +2577,37 @@ pub(super) fn button(
     div()
         .id(id)
         .px_3()
-        .py_2()
+        .py_1()
+        .min_h(px(32.0))
+        .flex()
+        .items_center()
         .rounded_md()
-        .bg(rgb(0x384354))
+        .bg(rgb(theme::ELEVATED))
         .cursor_pointer()
         .text_sm()
-        .hover(|button| button.bg(rgb(0x475975)))
+        .text_color(rgb(theme::TEXT))
+        .hover(|button| button.bg(rgb(theme::HOVER)))
         .child(label.into())
+}
+
+fn selected_button(button: Stateful<Div>) -> Stateful<Div> {
+    button
+        .bg(rgb(theme::SELECTED))
+        .text_color(rgb(theme::ACCENT))
+        .hover(|button| button.bg(rgb(theme::PRIMARY)))
+}
+
+fn toolbar_group() -> Div {
+    div()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .gap_1()
+        .p_1()
+        .rounded_lg()
+        .bg(rgb(theme::INPUT))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
 }
 
 fn watch_project(root: &std::path::Path) -> Result<(RecommendedWatcher, Receiver<WatchEvent>)> {
@@ -1968,7 +2689,7 @@ fn paint_graph(
     for dot in viewport.grid_points(bounds.size.width.as_f32(), bounds.size.height.as_f32()) {
         window.paint_quad(fill(
             Bounds::new(to_window(dot), size(px(1.5), px(1.5))),
-            rgb(0x48505f),
+            rgb(theme::GRID),
         ));
     }
     for &(start, end, _) in lines {
@@ -1977,7 +2698,7 @@ fn paint_graph(
         let mut line = PathBuilder::stroke(px(2.0));
         line.move_to(to_window(start));
         line.line_to(to_window(end));
-        window.paint_path(line.build()?, rgb(0x83b9f3));
+        window.paint_path(line.build()?, rgb(theme::ACCENT));
         let angle = (end.1 - start.1).atan2(end.0 - start.0);
         let length = 10.0 * viewport.scale;
         let width = 5.0 * viewport.scale;
@@ -1993,7 +2714,7 @@ fn paint_graph(
             base.1 + width * angle.cos(),
         )));
         arrow.close();
-        window.paint_path(arrow.build()?, rgb(0x83b9f3));
+        window.paint_path(arrow.build()?, rgb(theme::ACCENT));
     }
     Ok(())
 }
