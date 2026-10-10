@@ -367,16 +367,12 @@ impl ExternalEditor {
     }
 
     pub fn source_command(self, root: &Path, source: &SourceLocation) -> Result<EditorCommand> {
-        let root = root
-            .canonicalize()
-            .context("Cannot locate project folder")?;
+        let root = dunce::canonicalize(root).context("Cannot locate project folder")?;
         ensure!(
             !Path::new(&source.path).is_absolute(),
             "Source path must be project-relative"
         );
-        let path = root
-            .join(&source.path)
-            .canonicalize()
+        let path = dunce::canonicalize(root.join(&source.path))
             .with_context(|| format!("Cannot open source {}", source.path))?;
         ensure!(
             path.starts_with(&root),
@@ -867,6 +863,23 @@ mod tests {
             .context("Missing source argument")?
             .to_string_lossy();
         assert!(target.ends_with("camera backup;echo.rs:13:1"));
+        #[cfg(target_os = "windows")]
+        for editor in ExternalEditor::ALL {
+            let command = editor.source_command(root.path(), &source)?;
+            assert!(
+                !command
+                    .working_directory
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with(r"\\?\")
+            );
+            assert!(
+                command
+                    .arguments
+                    .iter()
+                    .all(|argument| !argument.to_string_lossy().starts_with(r"\\?\"))
+            );
+        }
         Ok(())
     }
 

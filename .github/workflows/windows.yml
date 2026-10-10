@@ -1,0 +1,52 @@
+name: Windows native
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-core:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository toolchain
+        run: rustup show
+      - name: Verify Linux core compatibility
+        run: cargo test --locked -j 2 --no-default-features --lib -p ros_studio_app -p ros_studio_codegen -p ros_studio_scan -p ros_studio_model -p ros_studio_protocol -p ros_studio_daemon
+      - name: Test source export and Linux packaging
+        run: python3 -m unittest discover -s script/tests -v
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: C:\cargo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the repository toolchain
+        shell: pwsh
+        run: rustup show
+      - name: Test the application core, scanner, generator, and protocol
+        run: cargo test --locked -j 2 --no-default-features --lib -p ros_studio_app -p ros_studio_codegen -p ros_studio_scan -p ros_studio_model -p ros_studio_protocol -p ros_studio_daemon
+      - name: Inspect the fixture without ROS or Docker
+        run: cargo run --locked -j 2 -p ros_studio_app --no-default-features --example inspect_project -- examples/drone_demo_ws
+      - name: Test source export
+        run: python -m unittest discover -s script/tests -v
+      - name: Build the native Windows executable and compiled shaders
+        run: cargo build --locked --release -j 2 -p ros_studio_app --bin ros2-studio
+      - name: Check executable startup
+        shell: pwsh
+        run: |
+          & ./target/release/ros2-studio.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Windows executable failed to start.' }
+      - name: Validate the Docker development script syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/script/build-ros2-studio-daemon-windows.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors) { throw ($errors | Out-String) }

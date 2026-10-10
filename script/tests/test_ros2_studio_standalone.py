@@ -55,7 +55,12 @@ class StandaloneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
-            (root / "source/link").symlink_to(root / "outside")
+            try:
+                (root / "source/link").symlink_to(root / "outside")
+            except OSError as error:
+                if getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege unavailable")
+                raise
             with self.assertRaisesRegex(ValueError, "External symbolic link"):
                 standalone.copy_tree(root / "source", root / "destination")
 

@@ -1,0 +1,9 @@
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.sh text eol=lf
+script/build-ros2-studio-daemon-linux text eol=lf
+script/clippy text eol=lf
+script/ros2-studio-standalone text eol=lf
+*.ps1 text eol=lf

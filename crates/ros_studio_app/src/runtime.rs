@@ -148,12 +148,7 @@ pub fn source_execution(
         "Choose a source file inside the project"
     );
     // Prefix file arguments so a filename beginning with '-' cannot become a compiler option.
-    let relative = format!(
-        "./{}",
-        path.strip_prefix(&root)?
-            .to_str()
-            .context("Source path is not UTF-8")?
-    );
+    let relative = format!("./{}", runtime_relative_path(path.strip_prefix(&root)?)?);
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -243,7 +238,7 @@ fn rust_source_command(
             (Operation::Run, false) => bail!("This Rust file is not a binary entry point. Choose its ROS node or a Cargo binary source"),
         }.into(),
         "--manifest-path".into(),
-        manifest.strip_prefix(root)?.to_string_lossy().into_owned(),
+        runtime_relative_path(manifest.strip_prefix(root)?)?,
     ];
     if let Some(binary) = binary {
         command.extend(["--bin".into(), binary]);
@@ -343,7 +338,7 @@ pub fn node_execution(
             }
             .into(),
             "--manifest-path".into(),
-            manifest.strip_prefix(&root)?.to_string_lossy().into_owned(),
+            runtime_relative_path(manifest.strip_prefix(&root)?)?,
             "--bin".into(),
             binary.into(),
         ]
@@ -383,6 +378,15 @@ pub fn node_execution(
         label: format!("{} {}", operation.label(), node.logical_name),
         command,
     })
+}
+
+// Commands execute on Linux even when the project is scanned on Windows.
+fn runtime_relative_path(path: &Path) -> Result<String> {
+    let path = path.to_str().context("Runtime path is not UTF-8")?;
+    #[cfg(target_os = "windows")]
+    return Ok(path.replace('\\', "/"));
+    #[cfg(not(target_os = "windows"))]
+    Ok(path.to_owned())
 }
 
 pub const MAX_CONSOLE_LINES: usize = 5000;
@@ -620,6 +624,42 @@ mod tests {
                 assert_eq!(graph_command.last().map(String::as_str), Some(expected));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_source_and_manifest_paths_use_linux_separators() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut project = design()?;
+        project.root_path = directory.path().to_string_lossy().into_owned();
+        std::fs::create_dir_all(directory.path().join("nested package/src"))?;
+        std::fs::write(
+            directory.path().join("nested package/src/camera.py"),
+            "print('camera')",
+        )?;
+        assert_eq!(
+            source_execution(&project, "nested package/src/camera.py", Operation::Run)?.command,
+            vec!["python3", "./nested package/src/camera.py"]
+        );
+        std::fs::write(
+            directory.path().join("nested package/Cargo.toml"),
+            "[package]\nname='camera'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        std::fs::write(
+            directory.path().join("nested package/src/main.rs"),
+            "fn main() {}",
+        )?;
+        assert_eq!(
+            source_execution(&project, "nested package/src/main.rs", Operation::Run)?.command,
+            vec![
+                "cargo",
+                "run",
+                "--manifest-path",
+                "nested package/Cargo.toml",
+                "--bin",
+                "camera"
+            ]
+        );
         Ok(())
     }
 

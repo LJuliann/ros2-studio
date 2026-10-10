@@ -23,6 +23,7 @@ gui = ["dep:gpui", "dep:gpui_platform", "dep:notify", "dep:walkdir", "dep:simple
 
 [dependencies]
 anyhow.workspace = true
+dunce.workspace = true
 ros_studio_model.workspace = true
 ros_studio_scan.workspace = true
 ros_studio_codegen.workspace = true

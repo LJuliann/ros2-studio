@@ -1248,7 +1248,11 @@ impl GraphView {
                     .flex_shrink_0()
                     .text_sm()
                     .text_color(rgb(theme::MUTED))
-                    .child("Detected from this project · execution on Host"),
+                    .child(if cfg!(target_os = "windows") {
+                        "Inspection only on Windows · use a node/file configuration with Docker"
+                    } else {
+                        "Detected from this project · execution on Host"
+                    }),
             )
             .child(
                 div()
@@ -1355,6 +1359,7 @@ impl GraphView {
     }
 
     fn make_row(&self, index: usize, busy: bool, cx: &mut Context<Self>) -> Div {
+        let busy = busy || !cfg!(unix);
         let target = self.make_catalog.targets[index].clone();
         let makefile = target.makefile.clone();
         let running = self.running_make.as_ref() == Some(&target);
@@ -1392,11 +1397,17 @@ impl GraphView {
                     .child(
                         button(
                             ("make-panel-run", index),
-                            if running { "Running" } else { "Run" },
+                            if !cfg!(unix) {
+                                "Unavailable"
+                            } else if running {
+                                "Running"
+                            } else {
+                                "Run"
+                            },
                         )
                         .when(busy, |button| button.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.active.is_none() && !this.launch_pending {
+                            if cfg!(unix) && this.active.is_none() && !this.launch_pending {
                                 this.launch_target(
                                     RunTarget::Make(target.clone()),
                                     Operation::Run,
@@ -1454,7 +1465,7 @@ impl GraphView {
                     })),
             );
         }
-        if !self.make_catalog.targets.is_empty() {
+        if cfg!(unix) && !self.make_catalog.targets.is_empty() {
             panel = panel
                 .child(div().text_sm().child("Makefile targets · run on host · Build/Run executes the chosen target"))
                 .child(div().text_sm().text_color(rgb(theme::WARNING))

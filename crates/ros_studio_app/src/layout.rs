@@ -211,7 +211,7 @@ fn ordering_score(
             index = target_row + 1;
             while index < prefix_counts.len() {
                 prefix_counts[index] += 1;
-                index += index & index.wrapping_neg();
+                index += index.isolate_lowest_one();
             }
         }
     }

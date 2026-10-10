@@ -442,10 +442,10 @@ mod tests {
         let mut project = scan_project(&workspace, "drone_demo_ws")?;
         project.root_path = "$WORKSPACE".to_owned();
 
-        let actual = serde_json::to_string_pretty(&project)?;
+        let actual = serde_json::to_value(&project)?;
         let expected = include_str!("../../../examples/drone_demo_ws/expected_graph.json");
 
-        assert_eq!(actual, expected.trim_end());
+        assert_eq!(actual, serde_json::from_str::<serde_json::Value>(expected)?);
 
         Ok(())
     }

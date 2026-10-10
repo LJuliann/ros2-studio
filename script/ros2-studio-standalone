@@ -91,7 +91,7 @@ def export_workspace(arguments):
         raise ValueError("Export outside the original repository")
     metadata = json.loads(run(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"], cwd=ROOT, capture_output=True).stdout)
     selected = workspace_closure(metadata)
-    members = {str(path.relative_to(ROOT)) for path in selected}
+    members = {path.relative_to(ROOT).as_posix() for path in selected}
     dependencies = {dependency.get("rename") or dependency["name"] for package in selected.values() for dependency in package["dependencies"]}
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ros2-studio-export-", dir=destination.parent) as temporary:
@@ -102,7 +102,7 @@ def export_workspace(arguments):
             if not target.exists():
                 copy_tree(directory, target)
         (staging / "Cargo.toml").write_text(export_manifest((ROOT / "Cargo.toml").read_text(), members, dependencies))
-        for name in ("Cargo.lock", "LICENSE-GPL", "LICENSE-APACHE", "clippy.toml", "typos.toml"):
+        for name in ("Cargo.lock", "LICENSE-GPL", "LICENSE-APACHE", "clippy.toml", "typos.toml", ".gitattributes"):
             if (ROOT / name).is_file():
                 shutil.copy2(ROOT / name, staging / name)
         toolchain = (ROOT / "rust-toolchain.toml").read_text()
@@ -120,7 +120,7 @@ def export_workspace(arguments):
         if (ROOT / "assets/fonts").is_dir():
             copy_tree(ROOT / "assets/fonts", staging / "assets/fonts")
         (staging / "script").mkdir(exist_ok=True)
-        for name in ("ros2-studio-standalone", "clippy", "build-ros2-studio-daemon-linux"):
+        for name in ("ros2-studio-standalone", "clippy", "build-ros2-studio-daemon-linux", "build-ros2-studio-daemon-windows.ps1"):
             shutil.copy2(ROOT / "script" / name, staging / "script" / name)
         copy_tree(ROOT / "script/licenses", staging / "script/licenses")
         if (ROOT / "script/tests/test_ros2_studio_standalone.py").is_file():

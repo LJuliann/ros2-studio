@@ -351,10 +351,22 @@ mod tests {
             ]
         );
         assert!(!root.path().join("should-not-exist").exists());
-        let execution = targets[3].execution(root.path(), Operation::Run)?;
-        assert_eq!(
-            execution.command,
-            ["make", "--file", "./Makefile", "--", "ros-run"]
+        #[cfg(unix)]
+        {
+            let execution = targets[3].execution(root.path(), Operation::Run)?;
+            assert_eq!(
+                execution.command,
+                ["make", "--file", "./Makefile", "--", "ros-run"]
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(
+            targets[3]
+                .execution(root.path(), Operation::Run)
+                .err()
+                .context("Unix Make execution must be rejected")?
+                .to_string()
+                .contains("Unix host")
         );
         Ok(())
     }

@@ -36,7 +36,57 @@ The command formats follow the [VS Code CLI](https://code.visualstudio.com/docs/
 [Zed CLI](https://zed.dev/docs/reference/cli), and
 [CLion CLI](https://www.jetbrains.com/help/clion/opening-files-from-command-line.html).
 Windows launcher names are `code.cmd`, `codium.cmd`, `zed`, and `clion64.exe`;
-Windows execution has not yet been validated.
+The Windows application runs natively; ROS processes run in Linux Docker containers.
+
+## Windows
+
+The graph, source scanning, node creation, preferences, and external editor run
+in a native Windows executable. Static inspection requires neither Docker nor ROS.
+ROS 2 Studio does not invoke WSL or require an Ubuntu installation on the host.
+
+For development, install the Rust toolchain declared in `rust-toolchain.toml`
+and Visual Studio C++ Build Tools with a Windows SDK. From PowerShell:
+
+```powershell
+cargo run --locked -j 2 -p ros_studio_app -- --editor code "C:\path\to\ROS2-Drone"
+```
+
+Live, health monitoring, Build/Run, and Stop require Docker Desktop using Linux
+containers and a Linux `ros-studio-daemon` built with `ros-runtime`. Choose Auto
+or Docker; Host ROS is unavailable on Windows. Docker manages its own Linux
+backend; its [Hyper-V backend](https://docs.docker.com/desktop/setup/install/windows-install/)
+is an option on supported Windows editions when WSL is unwanted. Enable Docker
+Desktop's [host networking](https://docs.docker.com/engine/network/drivers/host/)
+for projects such as ROS2-Drone that use `network_mode: host`. Docker must be
+running and `docker` available in the application's PATH.
+
+Build the Linux daemon from PowerShell 7, using the project's ROS Compose image:
+
+```powershell
+./script/build-ros2-studio-daemon-windows.ps1 -ProjectPath "C:\path\to\ROS2-Drone"
+```
+
+This development step builds the project's ROS image when necessary and writes
+`target/ros-humble/release/ros-studio-daemon`; it does not run drone nodes.
+For another Compose service use `-ComposeService`; without Compose use `-Image`.
+Windows packages with runtime support must include this **Linux** daemon next to
+`ros2-studio.exe` or in `libexec/ros-studio-daemon`. A native dummy daemon `.exe`
+cannot replace it. On Windows, `ROS_STUDIO_DAEMON_PATH` selects the Linux binary
+to mount in Docker; on Linux it keeps its direct-launch behavior.
+
+Make targets are discovered on Windows, but their host execution currently
+requires Unix. Use node/file configurations with Docker for Windows Build/Run.
+The project's Linux GUI tools and hardware forwarding need their own Docker
+configuration. End-to-end Docker discovery, health monitoring, Build/Run/Stop,
+and desktop interactions still require a Windows smoke test before a release.
+
+The `Windows native` GitHub workflow tests the core and fixture, builds the native
+release executable including DirectX shaders, and verifies `--help` startup.
+To inspect a real project without opening a window or executing its code:
+
+```powershell
+cargo run --locked -j 2 -p ros_studio_app --no-default-features --example inspect_project -- "C:\path\to\ROS2-Drone"
+```
 
 If hover, pan, or zoom feels slow, launch with `--diagnostics` to print the
 selected graphics adapter and driver in the terminal. `software rendering: true`
@@ -301,8 +351,9 @@ Scrolling up or selecting lines pauses follow; enabling Follow resumes it immedi
 and keeps it on as output arrives or the console is resized. Drag the divider to resize;
 **Close** only hides output (it does not stop the process); **Console** reopens it.
 
-Runtime support is currently Linux + a compatible ROS Humble environment.
-Windows/WSL runtime and arbitrary ROS distributions are not yet validated.
+Runtime uses a compatible ROS Humble environment: a Linux host or Linux Docker
+containers from Linux/Windows. Windows Docker integration remains a preview
+pending an end-to-end smoke test; arbitrary ROS distributions are not validated.
 
 ## Preferences
 
@@ -341,7 +392,7 @@ GPUI and its supporting source are still vendored from Zed Industries, with
 their licenses and attribution; independent does not mean dependency-free.
 The exporter verifies that the application's runtime graph contains no editor
 crates. The new workspace defaults to the standalone application and one build
-worker. Windows/WSL runtime support remains unvalidated.
+worker. See Windows above for the native application and Docker runtime setup.
 
 ## Standalone Linux packages
 

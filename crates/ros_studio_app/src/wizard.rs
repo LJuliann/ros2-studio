@@ -26,8 +26,9 @@ impl NodeDraft {
 }
 
 pub fn rust_packages(project: &Project) -> impl Iterator<Item = &Package> {
-    let root = Path::new(&project.root_path);
+    let root = Path::new(&project.root_path).canonicalize();
     project.packages.iter().filter(move |package| {
+        let Ok(root) = &root else { return false };
         root.join(&package.path)
             .join("Cargo.toml")
             .canonicalize()

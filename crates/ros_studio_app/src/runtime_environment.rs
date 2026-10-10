@@ -95,10 +95,15 @@ struct ComposeService {
 pub fn detect_runtime(root: &Path, preference: RuntimePreference) -> Result<LaunchPlan> {
     let root = root.canonicalize().context("Project folder is missing")?;
     ensure!(
-        cfg!(target_os = "linux"),
-        "ROS runtime in the standalone preview is currently Linux-only"
+        cfg!(any(target_os = "linux", target_os = "windows")),
+        "ROS runtime requires Linux or Windows with Docker Desktop"
     );
-    if let Some(path) = std::env::var_os("ROS_STUDIO_DAEMON_PATH") {
+    ensure!(
+        !cfg!(target_os = "windows") || preference != RuntimePreference::Host,
+        "Host ROS runtime is unavailable on Windows. Choose Auto or Docker and use Docker Desktop with Linux containers"
+    );
+    let override_path = std::env::var_os("ROS_STUDIO_DAEMON_PATH");
+    if let Some(path) = override_path.as_ref().filter(|_| cfg!(target_os = "linux")) {
         let daemon = PathBuf::from(path)
             .canonicalize()
             .context("ROS_STUDIO_DAEMON_PATH does not exist")?;
@@ -118,8 +123,22 @@ pub fn detect_runtime(root: &Path, preference: RuntimePreference) -> Result<Laun
         .parent()
         .and_then(Path::parent)
         .context("Cannot locate development repository")?;
-    let daemon = resolve_daemon(&std::env::current_exe()?, repository)?.canonicalize()?;
-    let host_available = Path::new(HOST_SETUP).is_file();
+    let daemon = match override_path {
+        Some(path) => PathBuf::from(path),
+        None => resolve_daemon(&std::env::current_exe()?, repository)?,
+    }
+    .canonicalize()
+    .context("ROS daemon does not exist")?;
+    if cfg!(target_os = "windows") {
+        use std::io::Read as _;
+        let mut magic = [0; 4];
+        std::fs::File::open(&daemon)?.read_exact(&mut magic)?;
+        ensure!(
+            magic == *b"\x7fELF",
+            "Docker requires a Linux ros-studio-daemon built with ros-runtime, not a Windows executable. Run script/build-ros2-studio-daemon-windows.ps1"
+        );
+    }
+    let host_available = cfg!(target_os = "linux") && Path::new(HOST_SETUP).is_file();
     let inherited_host = host_available
         && std::env::var("ROS_DISTRO").is_ok_and(|distribution| distribution == "humble");
     // An explicitly sourced host wins; otherwise prefer the project's Compose environment.
@@ -181,13 +200,8 @@ fn container_plan(
         .and_then(|name| name.to_str())
         .context("Project folder name is not UTF-8")?;
     let workspace = format!("/workspace/{name}");
-    for path in [root, daemon] {
-        ensure!(
-            !path.to_string_lossy().contains([',', ':']),
-            "Docker mount paths cannot contain commas or colons: {}",
-            path.display()
-        );
-    }
+    let root_mount = docker_mount_path(root)?;
+    let daemon_mount = docker_mount_path(daemon)?;
     let mut arguments: Vec<OsString>;
     let preparation;
     let label;
@@ -216,9 +230,9 @@ fn container_plan(
         });
         arguments.extend([
             "--volume".into(),
-            format!("{}:{CONTAINER_DAEMON}:ro", daemon.display()).into(),
+            format!("{daemon_mount}:{CONTAINER_DAEMON}:ro").into(),
             "--volume".into(),
-            format!("{}:{workspace}", root.display()).into(),
+            format!("{root_mount}:{workspace}").into(),
         ]);
     } else {
         arguments = vec![
@@ -233,13 +247,9 @@ fn container_plan(
         ];
         arguments.extend([
             "--mount".into(),
-            format!(
-                "type=bind,src={},dst={CONTAINER_DAEMON},readonly",
-                daemon.display()
-            )
-            .into(),
+            format!("type=bind,src={daemon_mount},dst={CONTAINER_DAEMON},readonly").into(),
             "--mount".into(),
-            format!("type=bind,src={},dst={workspace}", root.display()).into(),
+            format!("type=bind,src={root_mount},dst={workspace}").into(),
         ]);
         label = format!("Docker · {image}");
         preparation = None;
@@ -285,6 +295,35 @@ fn container_plan(
         workspace,
         label,
     })
+}
+
+fn docker_mount_path(path: &Path) -> Result<String> {
+    let value = path.to_str().context("Docker mount path is not UTF-8")?;
+    #[cfg(target_os = "windows")]
+    let value = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!("//{unc}")
+    } else {
+        value.strip_prefix(r"\\?\").unwrap_or(value).to_owned()
+    }
+    .replace('\\', "/");
+    #[cfg(not(target_os = "windows"))]
+    let value = value.to_owned();
+    let mut suffix = value.as_str();
+    if cfg!(target_os = "windows")
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+        && value.as_bytes().get(1..3) == Some(b":/")
+    {
+        suffix = &value[2..];
+    }
+    ensure!(
+        !suffix.contains([',', ':']),
+        "Docker mount paths cannot contain commas or extra colons: {}",
+        path.display()
+    );
+    Ok(value)
 }
 
 fn detect_compose(root: &Path, requested: Option<&str>) -> Result<Option<ComposeEnvironment>> {
@@ -357,10 +396,17 @@ fn resolve_daemon(executable: &Path, repository: &Path) -> Result<PathBuf> {
         .join("script/build-ros2-studio-daemon-linux")
         .is_file()
     {
-        format!(
-            "\nDevelopment setup: from {}, run CARGO_BUILD_JOBS=1 ./script/build-ros2-studio-daemon-linux once, then retry Connect or Build/Run. This builds the ROS-enabled daemon using the configured Docker image.",
-            repository.display()
-        )
+        if cfg!(target_os = "windows") {
+            format!(
+                "\nDevelopment setup: from {}, run ./script/build-ros2-studio-daemon-windows.ps1 -ProjectPath <ROS_PROJECT> once, then retry Connect or Build/Run. This builds a Linux ROS-enabled daemon in Docker. Auto selects the environment; it does not build the daemon.",
+                repository.display()
+            )
+        } else {
+            format!(
+                "\nDevelopment setup: from {}, run CARGO_BUILD_JOBS=1 ./script/build-ros2-studio-daemon-linux once, then retry Connect or Build/Run. This builds the ROS-enabled daemon using the configured Docker image.",
+                repository.display()
+            )
+        }
     } else {
         "\nInstall a complete ROS 2 Studio package containing libexec/ros-studio-daemon.".into()
     };
@@ -442,8 +488,42 @@ mod tests {
             .err()
             .context("a missing development daemon must be reported")?;
         let message = error.to_string();
-        assert!(message.contains("CARGO_BUILD_JOBS=1 ./script/build-ros2-studio-daemon-linux"));
+        assert!(message.contains(if cfg!(target_os = "windows") {
+            "build-ros2-studio-daemon-windows.ps1"
+        } else {
+            "CARGO_BUILD_JOBS=1 ./script/build-ros2-studio-daemon-linux"
+        }));
         assert!(message.contains("does not build the daemon"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn docker_mounts_accept_windows_drives_and_canonical_paths() -> Result<()> {
+        for path in [
+            r"C:\Users\Test User\project",
+            r"\\?\C:\Users\Test User\project",
+        ] {
+            assert_eq!(
+                docker_mount_path(Path::new(path))?,
+                "C:/Users/Test User/project"
+            );
+        }
+        assert_eq!(
+            docker_mount_path(Path::new(r"\\?\UNC\server\share\project"))?,
+            "//server/share/project"
+        );
+        assert!(docker_mount_path(Path::new(r"C:\project,invalid")).is_err());
+        assert!(docker_mount_path(Path::new(r"C:\project:invalid")).is_err());
+        let plan = container_plan(
+            Path::new(r"\\?\C:\ROS Projects\Drone"),
+            Path::new(r"\\?\C:\Studio\ros-studio-daemon"),
+            None,
+            "test-image",
+        )?;
+        assert!(plan.daemon.arguments.contains(&OsString::from(
+            "type=bind,src=C:/ROS Projects/Drone,dst=/workspace/Drone"
+        )));
         Ok(())
     }
 }

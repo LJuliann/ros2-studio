@@ -5647,6 +5647,7 @@ dependencies = [
  "async-channel 2.5.0",
  "async-io",
  "async-process",
+ "dunce",
  "futures",
  "gpui",
  "gpui_platform",

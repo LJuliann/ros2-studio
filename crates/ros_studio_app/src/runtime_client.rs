@@ -352,6 +352,7 @@ pub(crate) async fn forward_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::runtime_environment::CommandSpec;
 
     #[test]
@@ -500,7 +501,7 @@ while read -r request; do :; done
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     #[ignore = "requires a rebuilt ROS runtime daemon and sourced ROS Humble or Docker; creates only a dedicated test topic"]
     fn real_daemon_measures_topic_rate_then_silence_and_removes_the_watch() -> Result<()> {
@@ -602,7 +603,7 @@ while read -r request; do :; done
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     #[ignore = "requires a built ros-runtime daemon and a ROS Humble host or Docker image"]
     fn real_daemon_discovers_streams_and_stops_a_harmless_process() -> Result<()> {
