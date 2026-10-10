@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,6 +129,9 @@ def export_workspace(arguments):
             (staging / "script/tests").mkdir()
             shutil.copy2(ROOT / "script/tests/test_ros2_studio_standalone.py", staging / "script/tests/test_ros2_studio_standalone.py")
         (staging / "README.md").write_text((ROOT / "crates/ros_studio_app/README.md").read_text())
+        if (ROOT / "docs/windows-distribution.md").is_file():
+            (staging / "docs").mkdir(exist_ok=True)
+            shutil.copy2(ROOT / "docs/windows-distribution.md", staging / "docs/windows-distribution.md")
         (staging / "NOTICE.md").write_text(
             "# Attribution\n\nROS 2 Studio uses GPUI and supporting crates developed by Zed Industries.\n"
             "Their source headers and original licenses are retained. The Zed editor is not included.\n"
@@ -165,6 +170,112 @@ def checksum(path):
         for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
             digest.update(chunk)
     path.with_name(path.name + ".sha256").write_text(f"{digest.hexdigest()}  {path.name}\n")
+
+
+def windows_binary(path):
+    path = path.resolve(strict=True)
+    with path.open("rb") as binary:
+        header = binary.read(64)
+        if len(header) < 64 or header[:2] != b"MZ":
+            raise ValueError(f"Not a Windows PE binary: {path}")
+        binary.seek(struct.unpack_from("<I", header, 60)[0])
+        signature = binary.read(6)
+        if len(signature) != 6 or signature[:4] != b"PE\0\0" or signature[4:] != b"\x64\x86":
+            raise ValueError(f"Expected a Windows x86_64 PE binary: {path}")
+    return path
+
+
+def windows_crt_directory():
+    configured = os.environ.get("VCToolsRedistDir")
+    if configured:
+        return Path(configured) / "x64/Microsoft.VC143.CRT"
+    installer = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
+    if not installer.is_file():
+        raise ValueError("Provide --crt-dir with the x64 Microsoft.VC143.CRT redistributable directory")
+    installation = run([str(installer), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], capture_output=True).stdout.strip()
+    candidates = list((Path(installation) / "VC/Redist/MSVC").glob("*/x64/Microsoft.VC143.CRT"))
+    candidates = [path for path in candidates if re.fullmatch(r"[0-9.]+", path.parents[1].name)]
+    if not candidates:
+        raise ValueError("Cannot find the Visual C++ x64 redistributable; provide --crt-dir")
+    return max(candidates, key=lambda path: tuple(map(int, path.parents[1].name.split("."))))
+
+
+def windows_package(arguments):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-alpha\.[0-9]+)?", arguments.version):
+        raise ValueError("Use a version such as 0.2.0-alpha.3")
+    app_path = arguments.app_binary or ROOT / f"target/{arguments.profile}/ros2-studio.exe"
+    if "debug" in app_path.parts:
+        raise ValueError("Package an optimized release or release-fast executable, not target/debug")
+    app = windows_binary(app_path)
+    if not arguments.licenses.is_file():
+        raise ValueError("Provide --licenses with Windows-target third-party notices")
+    crt = arguments.crt_dir or windows_crt_directory()
+    if not (crt / "vcruntime140.dll").is_file():
+        raise ValueError("The x64 CRT directory must contain vcruntime140.dll")
+    runtime_files = sorted(crt.glob("*.dll"))
+    for runtime_file in runtime_files:
+        windows_binary(runtime_file)
+        if runtime_file.stem.lower().endswith("d"):
+            raise ValueError("Debug CRT DLLs cannot be packaged")
+    daemon = arguments.daemon_binary
+    if daemon:
+        with daemon.open("rb") as binary:
+            header = binary.read(20)
+        if len(header) < 20 or header[:6] != b"\x7fELF\x02\x01" or header[18:20] != b"\x3e\x00":
+            raise ValueError("The Windows Docker daemon must be a Linux x86_64 ELF binary")
+        if not arguments.daemon_licenses or not arguments.daemon_licenses.is_file():
+            raise ValueError("Provide --daemon-licenses with the Linux ROS-enabled daemon notices")
+    flavor = "docker-preview" if daemon else "inspection"
+    output = arguments.output.absolute()
+    artifact = output / f"ros2-studio-v{arguments.version}-windows-x86_64-{flavor}.zip"
+    if artifact.exists() or artifact.is_symlink() or artifact.with_name(artifact.name + ".sha256").exists():
+        raise ValueError(f"Artifact already exists; choose a new version or output directory: {artifact}")
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ros2-studio-windows-") as temporary:
+        application = Path(temporary) / "ros2-studio"
+        (application / "bin").mkdir(parents=True)
+        shutil.copy2(app, application / "bin/ros2-studio.exe")
+        for runtime_file in runtime_files:
+            shutil.copy2(runtime_file, application / "bin" / runtime_file.name)
+        for name in ("LICENSE-GPL", "LICENSE-APACHE", "NOTICE.md"):
+            shutil.copy2(ROOT / name, application / name)
+        shutil.copy2(arguments.licenses, application / "THIRD-PARTY-LICENSES-WINDOWS.md")
+        if daemon:
+            (application / "libexec").mkdir()
+            shutil.copy2(daemon, application / "libexec/ros-studio-daemon")
+            shutil.copy2(arguments.daemon_licenses, application / "THIRD-PARTY-LICENSES-DAEMON.md")
+        launch = '@echo off\r\nsetlocal\r\nset "ROS_STUDIO_SETTINGS_PATH=%~dp0data\\preferences.json"\r\n'
+        (application / "Start ROS 2 Studio.cmd").write_bytes((launch + '"%~dp0bin\\ros2-studio.exe" %*\r\nif errorlevel 1 pause\r\n').encode())
+        (application / "Diagnostics.cmd").write_bytes((launch + 'if not exist "%~dp0data" mkdir "%~dp0data"\r\ntype "%~dp0BUILD-INFO.json" > "%~dp0data\\diagnostics.log"\r\n"%~dp0bin\\ros2-studio.exe" --diagnostics %* >> "%~dp0data\\diagnostics.log" 2>&1\r\necho Log: "%~dp0data\\diagnostics.log"\r\npause\r\n').encode())
+        runtime_note = (
+            "This archive contains a Linux ROS daemon for Docker. Live/Build/Run/Stop require Docker Desktop with Linux containers and a compatible ROS Humble project image. Windows Docker runtime support is a preview.\n"
+            if daemon else
+            "This INSPECTION preview includes the native graph, source inspection, node generation and external editor. Live/Build/Run/Stop are not included: they need a separately built Linux ROS daemon and Docker.\n"
+        )
+        (application / "README.txt").write_text(
+            "ROS 2 Studio — Windows x64 portable preview\n\n"
+            "Extract the entire ZIP into a writable folder before running. Double-click Start ROS 2 Studio.cmd, then Open project. No Rust, Visual Studio, ROS or WSL installation is needed for inspection. The Visual C++ runtime DLLs are included beside the executable.\n\n"
+            "Launchers save preferences in data/preferences.json inside this folder. Launching bin/ros2-studio.exe directly uses normal Windows application preferences instead.\n\n"
+            "Windows 11 x64 is the currently tested OS. Hardware graphics acceleration is recommended. Other Windows versions and GPUs are not yet validated. This is an optimized build, but performance on other machines is not yet measured.\n\n"
+            "If rendering is slow or startup fails, close the app, run Diagnostics.cmd and open a project. Close the app after reproducing the issue and share data/diagnostics.log plus Windows version, display resolution/scaling and the action that was slow. software rendering: true means CPU rendering.\n\n"
+            + runtime_note + "\nUnix host Make execution is unavailable on Windows.\n\n"
+            "Source: https://github.com/LJuliann/ros2-studio\nVisual C++ runtime: https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files\n",
+            encoding="utf-8",
+        )
+        revision = run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True).stdout.strip()
+        (application / "BUILD-INFO.json").write_text(json.dumps({
+            "version": arguments.version, "target": "x86_64-pc-windows-msvc",
+            "profile": arguments.profile, "source_revision": revision,
+            "app_sha256": hashlib.sha256(app.read_bytes()).hexdigest(),
+            "runtime": flavor, "crt_version": crt.parents[1].name,
+            "performance_on_other_hardware_validated": False,
+        }, indent=2) + "\n")
+        with zipfile.ZipFile(artifact, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+            for path in sorted(application.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(application.parent).as_posix())
+        checksum(artifact)
+    print(f"Created {artifact}")
 
 
 def package(arguments):
@@ -245,6 +356,16 @@ def main():
         packaging.add_argument("--licenses", type=Path, required=True, help="Generated third-party notices for the standalone dependency graph")
         packaging.add_argument("--keep-debug", action="store_true", help="Keep debug sections instead of stripping the packaged copies")
         packaging.set_defaults(action=package)
+    windows = commands.add_parser("windows-portable", help="Package an optimized Windows x64 executable, CRT DLLs and notices into a portable ZIP")
+    windows.add_argument("version")
+    windows.add_argument("--profile", choices=("release", "release-fast"), default="release")
+    windows.add_argument("--app-binary", type=Path)
+    windows.add_argument("--crt-dir", type=Path, help="x64 Microsoft.VC143.CRT directory; detected from Visual Studio by default")
+    windows.add_argument("--licenses", type=Path, required=True, help="Notices generated for the Windows application dependency graph")
+    windows.add_argument("--daemon-binary", type=Path, help="Optional Linux x86_64 daemon compiled with ros-runtime")
+    windows.add_argument("--daemon-licenses", type=Path, help="Notices for the optional Linux ROS daemon")
+    windows.add_argument("--output", type=Path, default=ROOT / "target/windows-portable")
+    windows.set_defaults(action=windows_package)
     arguments = parser.parse_args()
     try:
         arguments.action(arguments)

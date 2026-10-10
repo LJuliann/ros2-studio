@@ -31,9 +31,17 @@ ROS 2 Studio does not launch WSL or require an Ubuntu distribution.
   10 nodes, 3 links, 4 Rust generator targets. All discovered nodes resolve a
   build command with Linux-compatible relative paths. No node was executed.
 - Docker Compose parses that project's ROS service configuration on Windows.
-- Exporter tests: 5 passing; Linux package generation and privileged symlink
-  creation skipped on this host.
 - Windows daemon build script: PowerShell syntax checked.
+- Windows portable inspection ZIP: generated with the optimized `release-fast`
+  executable, x64 Visual C++ release DLLs, Windows-target notices, portable
+  launchers and SHA-256 checksum. Extracted into a folder containing spaces;
+  `--help` succeeds, the native window responds with ROS2-Drone, the loaded CRT
+  DLL comes from the extracted package, and preferences are stored in its local
+  `data` directory. Package size is approximately 6.3 MiB.
+- Packaging/exporter tests: 7 passing, 2 skipped on this host. Wrong PE platform,
+  debug paths, absent daemon notices, ZIP contents and overwrite protection are
+  covered. The GitHub workflow now uploads the inspection ZIP after its checks;
+  that remote workflow has not been run for these packaging changes yet.
 
 ## Remaining before a Windows runtime release
 
@@ -43,8 +51,9 @@ ROS 2 Studio does not launch WSL or require an Ubuntu distribution.
 - Exercise rendering, pan/zoom, native dialogs, editor opening, project restore,
   and source watching on a Windows desktop.
 - Run the GitHub workflow's optimized release build and startup check.
-- Package the native executable with the Linux daemon and corresponding
-  Windows/daemon third-party notices, then test that package on a clean machine.
+- Test the portable inspection ZIP on a clean Windows machine and other GPUs.
+  For runtime support, package the native executable with a tested Linux daemon
+  and corresponding notices, then test that full package on a clean machine.
 
 Unix host Make execution remains unavailable on Windows. The Make panel explains
 this and disables execution; use node/file configurations with Docker instead.

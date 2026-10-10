@@ -3,8 +3,10 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import tarfile
+import struct
 from types import SimpleNamespace
 import unittest
+import zipfile
 
 
 loader = importlib.machinery.SourceFileLoader("standalone", str(Path(__file__).resolve().parents[1] / "ros2-studio-standalone"))
@@ -14,6 +16,65 @@ loader.exec_module(standalone)
 
 
 class StandaloneTests(unittest.TestCase):
+    @staticmethod
+    def pe_fixture(path, machine=0x8664):
+        header = bytearray(64)
+        header[:2] = b"MZ"
+        struct.pack_into("<I", header, 60, 64)
+        path.write_bytes(header + b"PE\0\0" + struct.pack("<H", machine))
+
+    def test_windows_package_includes_crt_and_portable_launchers_without_build_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "ros2-studio.exe"
+            self.pe_fixture(app)
+            crt = root / "crt"
+            crt.mkdir()
+            self.pe_fixture(crt / "vcruntime140.dll")
+            notices = root / "notices.md"
+            notices.write_text("Packaging test fixture only")
+            arguments = SimpleNamespace(version="0.2.0-alpha.3", profile="release", app_binary=app, crt_dir=crt, licenses=notices, daemon_binary=None, daemon_licenses=None, output=root / "dist")
+            standalone.windows_package(arguments)
+            artifact = next(arguments.output.glob("*.zip"))
+            with zipfile.ZipFile(artifact) as archive:
+                names = archive.namelist()
+                self.assertIn("ros2-studio/bin/ros2-studio.exe", names)
+                self.assertIn("ros2-studio/bin/vcruntime140.dll", names)
+                self.assertIn("ros2-studio/THIRD-PARTY-LICENSES-WINDOWS.md", names)
+                self.assertFalse(any("libexec" in name or name.endswith((".pdb", ".hlsl")) for name in names))
+                launch = archive.read("ros2-studio/Start ROS 2 Studio.cmd").decode()
+                self.assertIn('"%~dp0bin\\ros2-studio.exe" %*', launch)
+                self.assertIn("ROS_STUDIO_SETTINGS_PATH=%~dp0data\\preferences.json", launch)
+                self.assertIn("INSPECTION", archive.read("ros2-studio/README.txt").decode())
+                self.assertTrue(all(not name.startswith("/") and ".." not in Path(name).parts for name in names))
+            self.assertTrue(artifact.with_name(artifact.name + ".sha256").is_file())
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                standalone.windows_package(arguments)
+            arguments.version = "0.2.0-alpha.4"
+            daemon = root / "ros-studio-daemon"
+            daemon.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + b"\x3e\x00")
+            arguments.daemon_binary = daemon
+            with self.assertRaisesRegex(ValueError, "daemon-licenses"):
+                standalone.windows_package(arguments)
+            arguments.daemon_licenses = notices
+            standalone.windows_package(arguments)
+            with zipfile.ZipFile(next(arguments.output.glob("*docker-preview.zip"))) as archive:
+                self.assertIn("ros2-studio/libexec/ros-studio-daemon", archive.namelist())
+
+    def test_windows_package_rejects_linux_arm_and_debug_app_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "app.exe"
+            binary.write_bytes(b"\x7fELF" + bytes(64))
+            with self.assertRaisesRegex(ValueError, "Not a Windows PE"):
+                standalone.windows_binary(binary)
+            self.pe_fixture(binary, machine=0xAA64)
+            with self.assertRaisesRegex(ValueError, "x86_64"):
+                standalone.windows_binary(binary)
+            arguments = SimpleNamespace(version="0.2.0-alpha.3", app_binary=root / "target/debug/app.exe", profile="release")
+            with self.assertRaisesRegex(ValueError, "optimized"):
+                standalone.windows_package(arguments)
+
     def test_manifest_has_only_selected_members_and_no_editor_profiles(self):
         document = '[workspace]\nmembers = ["crates/zed"]\n[workspace.dependencies]\nzed = { path = "crates/zed" }\ngpui = { path = "crates/gpui" }\nserde = "1"\n[patch.crates-io]\nwebrtc-sys = { git = "bad" }\nasync-process = { git = "good" }\n[profile.release.package]\nzed = { codegen-units = 16 }\n[profile.release-fast]\ninherits = "release"\n'
         exported = standalone.export_manifest(document, {"crates/gpui", "crates/ros_studio_app"})
