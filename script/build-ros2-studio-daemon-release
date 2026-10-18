@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run inside a Linux ROS Humble environment; never runs drone nodes.
+set -eo pipefail
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repository_root"
+. /opt/ros/humble/setup.bash
+set -u
+
+export ROS_LOCALHOST_ONLY=1
+export ROS_DOMAIN_ID=42
+export ROS_STUDIO_RUNTIME=host
+export ROS_STUDIO_DAEMON_PATH="$repository_root/target/ros-humble/release/ros-studio-daemon"
+
+cargo build --locked --release -j 2 --target-dir target/ros-humble \
+    -p ros_studio_daemon --features ros-runtime --bin ros-studio-daemon
+
+# Both opt-in tests use the exact binary that will be included in the ZIP.
+# They check real ROS discovery, streamed output, Stop, topic rate and silence.
+cargo test --locked -j 2 -p ros_studio_app --no-default-features --lib \
+    real_daemon_ -- --ignored --nocapture --test-threads=1 --color=never \
+    | tee target/ros-humble/runtime-smoke-tests.log
+grep -Fq 'test result: ok. 2 passed;' target/ros-humble/runtime-smoke-tests.log
+
+mkdir -p target/ros-humble
+cargo about generate --locked --fail --target x86_64-unknown-linux-gnu \
+    --manifest-path crates/ros_studio_daemon/Cargo.toml --features ros-runtime \
+    --config script/licenses/zed-licenses.toml \
+    --output-file target/ros-humble/THIRD-PARTY-LICENSES-DAEMON.md \
+    script/licenses/template.md.hbs
+
+python3 - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+
+binary = Path("target/ros-humble/release/ros-studio-daemon")
+information = {
+    "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+    "target": "x86_64-unknown-linux-gnu",
+    "ros_distro": "humble",
+    "features": ["ros-runtime"],
+    "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    "validated_tests": ["discovery-output-stop", "health-rate-silence"],
+}
+Path("target/ros-humble/DAEMON-INFO.json").write_text(json.dumps(information, indent=2) + "\n")
+PY

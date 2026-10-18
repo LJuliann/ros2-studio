@@ -1,5 +1,7 @@
 import importlib.machinery
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import tarfile
@@ -33,7 +35,11 @@ class StandaloneTests(unittest.TestCase):
             self.pe_fixture(crt / "vcruntime140.dll")
             notices = root / "notices.md"
             notices.write_text("Packaging test fixture only")
-            arguments = SimpleNamespace(version="0.2.0-alpha.3", profile="release", app_binary=app, crt_dir=crt, licenses=notices, daemon_binary=None, daemon_licenses=None, output=root / "dist")
+            arguments = SimpleNamespace(version="0.2.0-alpha.3", profile="release", app_binary=app, crt_dir=crt, licenses=notices, daemon_binary=None, daemon_licenses=None, daemon_info=None, inspection_only=False, output=root / "dist")
+            with self.assertRaisesRegex(ValueError, "requires --daemon-binary"):
+                standalone.windows_package(arguments)
+            self.assertFalse(arguments.output.exists())
+            arguments.inspection_only = True
             standalone.windows_package(arguments)
             artifact = next(arguments.output.glob("*.zip"))
             with zipfile.ZipFile(artifact) as archive:
@@ -54,12 +60,44 @@ class StandaloneTests(unittest.TestCase):
             daemon = root / "ros-studio-daemon"
             daemon.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + b"\x3e\x00")
             arguments.daemon_binary = daemon
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                standalone.windows_package(arguments)
+            arguments.inspection_only = False
             with self.assertRaisesRegex(ValueError, "daemon-licenses"):
                 standalone.windows_package(arguments)
             arguments.daemon_licenses = notices
+            with self.assertRaisesRegex(ValueError, "daemon-info"):
+                standalone.windows_package(arguments)
+            information = {
+                "source_revision": standalone.run(["git", "rev-parse", "HEAD"], cwd=standalone.ROOT, capture_output=True).stdout.strip(),
+                "target": "x86_64-unknown-linux-gnu", "ros_distro": "humble",
+                "features": ["ros-runtime"], "binary_sha256": "incorrect",
+                "validated_tests": ["discovery-output-stop", "health-rate-silence"],
+            }
+            arguments.daemon_info = root / "DAEMON-INFO.json"
+            arguments.daemon_info.write_text(json.dumps(information))
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                standalone.windows_package(arguments)
+            information["binary_sha256"] = hashlib.sha256(daemon.read_bytes()).hexdigest()
+            information["features"] = []
+            arguments.daemon_info.write_text(json.dumps(information))
+            with self.assertRaisesRegex(ValueError, "ros-runtime"):
+                standalone.windows_package(arguments)
+            information["features"] = ["ros-runtime"]
+            information["source_revision"] = "old-source-revision"
+            arguments.daemon_info.write_text(json.dumps(information))
+            with self.assertRaisesRegex(ValueError, "same commit"):
+                standalone.windows_package(arguments)
+            information["source_revision"] = standalone.run(["git", "rev-parse", "HEAD"], cwd=standalone.ROOT, capture_output=True).stdout.strip()
+            arguments.daemon_info.write_text(json.dumps(information))
             standalone.windows_package(arguments)
             with zipfile.ZipFile(next(arguments.output.glob("*docker-preview.zip"))) as archive:
                 self.assertIn("ros2-studio/libexec/ros-studio-daemon", archive.namelist())
+                self.assertEqual(archive.read("ros2-studio/libexec/ros-studio-daemon"), daemon.read_bytes())
+                packaged_info = json.loads(archive.read("ros2-studio/BUILD-INFO.json"))
+                self.assertEqual(packaged_info["runtime"], "docker-preview")
+                self.assertEqual(packaged_info["daemon"], information)
+                self.assertIn("ros2-studio/libexec/DAEMON-INFO.json", archive.namelist())
 
     def test_windows_package_rejects_linux_arm_and_debug_app_binaries(self):
         with tempfile.TemporaryDirectory() as directory:

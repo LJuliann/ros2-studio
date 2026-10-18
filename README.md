@@ -87,8 +87,9 @@ and desktop interactions still require a Windows smoke test before a release.
 
 The `Windows native` GitHub workflow tests the core and fixture, builds the native
 release executable including DirectX shaders, and verifies `--help` startup.
-It also generates Windows-specific notices and uploads a portable inspection
-preview ZIP with a SHA-256 checksum. See [Windows portable distribution](docs/windows-distribution.md)
+It also builds and smoke-tests the Linux ROS daemon, generates platform-specific
+notices, and uploads a portable Docker preview ZIP containing both binaries and
+a SHA-256 checksum. See [Windows portable distribution](docs/windows-distribution.md)
 for download, local packaging, prerelease publication, and hardware testing.
 To inspect a real project without opening a window or executing its code:
 

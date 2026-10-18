@@ -477,6 +477,22 @@ mod tests {
     }
 
     #[test]
+    fn finds_portable_linux_daemon_next_to_the_windows_bin_folder() -> Result<()> {
+        let package = tempfile::tempdir()?;
+        let repository = tempfile::tempdir()?;
+        std::fs::create_dir(package.path().join("bin"))?;
+        std::fs::create_dir(package.path().join("libexec"))?;
+        let daemon = package.path().join("libexec/ros-studio-daemon");
+        std::fs::write(&daemon, b"\x7fELF")?;
+        let resolved = resolve_daemon(
+            &package.path().join("bin/ros2-studio.exe"),
+            repository.path(),
+        )?;
+        assert_eq!(resolved.canonicalize()?, daemon.canonicalize()?);
+        Ok(())
+    }
+
+    #[test]
     fn missing_development_daemon_explains_how_to_build_it() -> Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::create_dir(root.path().join("script"))?;

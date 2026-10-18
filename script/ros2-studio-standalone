@@ -122,7 +122,7 @@ def export_workspace(arguments):
         if (ROOT / "assets/fonts").is_dir():
             copy_tree(ROOT / "assets/fonts", staging / "assets/fonts")
         (staging / "script").mkdir(exist_ok=True)
-        for name in ("ros2-studio-standalone", "clippy", "build-ros2-studio-daemon-linux", "build-ros2-studio-daemon-windows.ps1"):
+        for name in ("ros2-studio-standalone", "clippy", "build-ros2-studio-daemon-linux", "build-ros2-studio-daemon-release", "build-ros2-studio-daemon-windows.ps1"):
             shutil.copy2(ROOT / "script" / name, staging / "script" / name)
         copy_tree(ROOT / "script/licenses", staging / "script/licenses")
         if (ROOT / "script/tests/test_ros2_studio_standalone.py").is_file():
@@ -218,6 +218,13 @@ def windows_package(arguments):
         if runtime_file.stem.lower().endswith("d"):
             raise ValueError("Debug CRT DLLs cannot be packaged")
     daemon = arguments.daemon_binary
+    inspection_only = arguments.inspection_only
+    if not daemon and not inspection_only:
+        raise ValueError("The portable package requires --daemon-binary, --daemon-licenses and --daemon-info; use --inspection-only explicitly for a reduced archive")
+    if daemon and inspection_only:
+        raise ValueError("--inspection-only cannot be combined with a daemon")
+    revision = run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True).stdout.strip()
+    daemon_information = None
     if daemon:
         with daemon.open("rb") as binary:
             header = binary.read(20)
@@ -225,6 +232,22 @@ def windows_package(arguments):
             raise ValueError("The Windows Docker daemon must be a Linux x86_64 ELF binary")
         if not arguments.daemon_licenses or not arguments.daemon_licenses.is_file():
             raise ValueError("Provide --daemon-licenses with the Linux ROS-enabled daemon notices")
+        if not arguments.daemon_info or not arguments.daemon_info.is_file():
+            raise ValueError("Provide --daemon-info from the tested ROS runtime build")
+        daemon_information = json.loads(arguments.daemon_info.read_text(encoding="utf-8"))
+        if not isinstance(daemon_information, dict):
+            raise ValueError("Daemon build information must be a JSON object")
+        if daemon_information.get("source_revision") != revision:
+            raise ValueError("Daemon and application sources must come from the same commit")
+        if daemon_information.get("binary_sha256") != hashlib.sha256(daemon.read_bytes()).hexdigest():
+            raise ValueError("Daemon checksum does not match its build information")
+        if (not isinstance(daemon_information.get("features"), list)
+                or not isinstance(daemon_information.get("validated_tests"), list)
+                or daemon_information.get("target") != "x86_64-unknown-linux-gnu"
+                or daemon_information.get("ros_distro") != "humble"
+                or "ros-runtime" not in daemon_information.get("features", [])
+                or not {"discovery-output-stop", "health-rate-silence"}.issubset(daemon_information.get("validated_tests", []))):
+            raise ValueError("Daemon must be built with ros-runtime and pass both real ROS smoke tests")
     flavor = "docker-preview" if daemon else "inspection"
     output = arguments.output.absolute()
     artifact = output / f"ros2-studio-v{arguments.version}-windows-x86_64-{flavor}.zip"
@@ -244,6 +267,7 @@ def windows_package(arguments):
             (application / "libexec").mkdir()
             shutil.copy2(daemon, application / "libexec/ros-studio-daemon")
             shutil.copy2(arguments.daemon_licenses, application / "THIRD-PARTY-LICENSES-DAEMON.md")
+            shutil.copy2(arguments.daemon_info, application / "libexec/DAEMON-INFO.json")
         launch = '@echo off\r\nsetlocal\r\nset "ROS_STUDIO_SETTINGS_PATH=%~dp0data\\preferences.json"\r\n'
         (application / "Start ROS 2 Studio.cmd").write_bytes((launch + '"%~dp0bin\\ros2-studio.exe" %*\r\nif errorlevel 1 pause\r\n').encode())
         (application / "Diagnostics.cmd").write_bytes((launch + 'if not exist "%~dp0data" mkdir "%~dp0data"\r\ntype "%~dp0BUILD-INFO.json" > "%~dp0data\\diagnostics.log"\r\n"%~dp0bin\\ros2-studio.exe" --diagnostics %* >> "%~dp0data\\diagnostics.log" 2>&1\r\necho Log: "%~dp0data\\diagnostics.log"\r\npause\r\n').encode())
@@ -262,12 +286,12 @@ def windows_package(arguments):
             "Source: https://github.com/LJuliann/ros2-studio\nVisual C++ runtime: https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files\n",
             encoding="utf-8",
         )
-        revision = run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True).stdout.strip()
         (application / "BUILD-INFO.json").write_text(json.dumps({
             "version": arguments.version, "target": "x86_64-pc-windows-msvc",
             "profile": arguments.profile, "source_revision": revision,
             "app_sha256": hashlib.sha256(app.read_bytes()).hexdigest(),
             "runtime": flavor, "crt_version": crt.parents[1].name,
+            "daemon": daemon_information,
             "performance_on_other_hardware_validated": False,
         }, indent=2) + "\n")
         with zipfile.ZipFile(artifact, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
@@ -362,8 +386,10 @@ def main():
     windows.add_argument("--app-binary", type=Path)
     windows.add_argument("--crt-dir", type=Path, help="x64 Microsoft.VC143.CRT directory; detected from Visual Studio by default")
     windows.add_argument("--licenses", type=Path, required=True, help="Notices generated for the Windows application dependency graph")
-    windows.add_argument("--daemon-binary", type=Path, help="Optional Linux x86_64 daemon compiled with ros-runtime")
-    windows.add_argument("--daemon-licenses", type=Path, help="Notices for the optional Linux ROS daemon")
+    windows.add_argument("--daemon-binary", type=Path, help="Linux x86_64 daemon compiled with ros-runtime; required unless --inspection-only")
+    windows.add_argument("--daemon-licenses", type=Path, help="Notices for the Linux ROS daemon")
+    windows.add_argument("--daemon-info", type=Path, help="Build and smoke-test information for the Linux ROS daemon")
+    windows.add_argument("--inspection-only", action="store_true", help="Explicitly omit ROS runtime functions; never used for the default GitHub download")
     windows.add_argument("--output", type=Path, default=ROOT / "target/windows-portable")
     windows.set_defaults(action=windows_package)
     arguments = parser.parse_args()

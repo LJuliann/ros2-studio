@@ -57,3 +57,23 @@ ROS 2 Studio does not launch WSL or require an Ubuntu distribution.
 
 Unix host Make execution remains unavailable on Windows. The Make panel explains
 this and disables execution; use node/file configurations with Docker instead.
+
+## Daemon packaging correction - 2026-10-17
+
+The alpha.3 inspection archive did not include a ROS daemon. The corrected
+default workflow is intended to produce an alpha.4 `docker-preview` archive:
+Linux compiles the `ros-runtime` daemon and runs both real ROS integration tests;
+Windows downloads that exact binary, notices and build information and includes
+them in the ZIP. Packaging now rejects missing runtime components, mismatched
+source commits/checksums and incomplete smoke-test records. An inspection-only
+archive requires an explicit `--inspection-only` option.
+
+Local verification: 7 packaging/exporter tests passed (2 platform/privilege skips)
+and all 6 runtime environment tests passed, including resolution of the daemon
+in `libexec` next to a portable `bin/ros2-studio.exe`. Workflow dependencies and
+packaging arguments were checked; the build script syntax is also checked.
+
+The local Docker engine is not running, so the new daemon build and real ROS
+tests have not been executed here. The changed GitHub workflow must pass after
+pushing before a corrected runtime ZIP is available. Windows-to-Docker execution
+and the extracted runtime package still need testing on a separate Windows PC.

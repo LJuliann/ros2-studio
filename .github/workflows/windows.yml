@@ -20,7 +20,42 @@ jobs:
         run: cargo test --locked -j 2 --no-default-features --lib -p ros_studio_app -p ros_studio_codegen -p ros_studio_scan -p ros_studio_model -p ros_studio_protocol -p ros_studio_daemon
       - name: Test source export and Linux packaging
         run: python3 -m unittest discover -s script/tests -v
+  linux-daemon:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    container: ros:humble-ros-base-jammy
+    env:
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Linux ROS daemon build dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config python3 ros-humble-std-msgs
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$toolchain"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Install the license notice generator
+        run: cargo install cargo-about --version 0.8.2 --locked
+      - name: Build and exercise the real ROS Humble daemon
+        shell: bash
+        run: bash script/build-ros2-studio-daemon-release
+      - name: Upload the tested Linux daemon and notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros2-studio-linux-daemon-${{ github.sha }}
+          path: |
+            target/ros-humble/release/ros-studio-daemon
+            target/ros-humble/THIRD-PARTY-LICENSES-DAEMON.md
+            target/ros-humble/DAEMON-INFO.json
+            target/ros-humble/runtime-smoke-tests.log
+          if-no-files-found: error
+          retention-days: 30
   windows:
+    needs: [linux-core, linux-daemon]
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -58,12 +93,17 @@ jobs:
           New-Item -ItemType Directory -Force target/windows-notices | Out-Null
           cargo about generate --locked --fail --target x86_64-pc-windows-msvc --manifest-path crates/ros_studio_app/Cargo.toml --config script/licenses/zed-licenses.toml --output-file target/windows-notices/THIRD-PARTY-LICENSES-WINDOWS.md script/licenses/template.md.hbs
           if ($LASTEXITCODE -ne 0) { throw 'Cannot generate Windows notices.' }
-      - name: Package the optimized portable inspection preview
-        run: python script/ros2-studio-standalone windows-portable 0.2.0-alpha.3 --licenses target/windows-notices/THIRD-PARTY-LICENSES-WINDOWS.md
+      - name: Download the tested Linux ROS runtime component
+        uses: actions/download-artifact@v4
+        with:
+          name: ros2-studio-linux-daemon-${{ github.sha }}
+          path: target/ros-humble
+      - name: Package the optimized portable application with its ROS daemon
+        run: python script/ros2-studio-standalone windows-portable 0.2.0-alpha.4 --licenses target/windows-notices/THIRD-PARTY-LICENSES-WINDOWS.md --daemon-binary target/ros-humble/release/ros-studio-daemon --daemon-licenses target/ros-humble/THIRD-PARTY-LICENSES-DAEMON.md --daemon-info target/ros-humble/DAEMON-INFO.json
       - name: Upload the portable ZIP and checksum
         uses: actions/upload-artifact@v4
         with:
-          name: ros2-studio-windows-x64-inspection-${{ github.sha }}
+          name: ros2-studio-windows-x64-docker-preview-${{ github.sha }}
           path: |
             target/windows-portable/*.zip
             target/windows-portable/*.sha256
