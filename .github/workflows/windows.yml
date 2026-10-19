@@ -58,7 +58,11 @@ jobs:
         run: cargo install cargo-about --version 0.8.2 --locked
       - name: Build and exercise the real ROS Humble daemon
         shell: bash
-        run: bash script/build-ros2-studio-daemon-release
+        run: |
+          # Trust this checkout in the container user's Git configuration.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
+          bash script/build-ros2-studio-daemon-release
       - name: Upload the tested Linux daemon and notices
         uses: actions/upload-artifact@v4
         with:
