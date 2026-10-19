@@ -1,9 +1,7 @@
 # ROS 2 Studio standalone
 
 Open a ROS project, inspect its Design/Live graph, and open source files in your
-preferred editor. This application uses GPUI for its window, but does not embed
-the Zed editor or depend on `ros_studio_zed`, `editor`, `project`, `workspace`,
-or `lsp`.
+preferred editor. This application uses GPUI for its window.
 
 The source can run in the original Cargo workspace or be exported into an
 independent workspace containing only the ROS crates and GPUI support crates.
