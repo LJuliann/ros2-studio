@@ -33,11 +33,27 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config python3 ros-humble-std-msgs
+          # rclrs 0.7 links its vendored interfaces, including example_interfaces
+          # and test_msgs, even when building the daemon without Rust tests.
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git pkg-config python3 \
+            ros-humble-example-interfaces ros-humble-std-msgs ros-humble-test-msgs
           toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
           test -n "$toolchain"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$toolchain"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Verify the ROS interface libraries
+        shell: bash
+        run: |
+          for package in action_msgs builtin_interfaces example_interfaces rcl_interfaces rosgraph_msgs std_msgs test_msgs unique_identifier_msgs; do
+            for suffix in rosidl_generator_c rosidl_typesupport_c; do
+              library="/opt/ros/humble/lib/lib${package}__${suffix}.so"
+              if [[ ! -f "$library" ]]; then
+                echo "::error::Missing ROS interface library: $library"
+                exit 1
+              fi
+            done
+          done
       - name: Install the license notice generator
         run: cargo install cargo-about --version 0.8.2 --locked
       - name: Build and exercise the real ROS Humble daemon
