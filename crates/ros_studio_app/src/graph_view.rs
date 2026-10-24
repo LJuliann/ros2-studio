@@ -89,6 +89,7 @@ pub struct GraphView {
     design_project: Option<Project>,
     overlay: RuntimeOverlay,
     health_snapshot: HealthSnapshot,
+    health_topics: Vec<ros_studio_protocol::health::TopicWatch>,
     health_error: Option<String>,
     health_settings_error: Option<String>,
     health_topic: Option<(String, String)>,
@@ -152,7 +153,7 @@ impl GraphView {
         let make_filter = cx.new(|cx| TextInput::new("Search Make commands…", false, cx));
         let make_filter_subscription =
             cx.subscribe(&make_filter, |_, _, _: &Changed, cx| cx.notify());
-        let health_hz = cx.new(|cx| TextInput::new("Expected Hz", false, cx));
+        let health_hz = cx.new(|cx| TextInput::new("Optional expected Hz", false, cx));
         let health_timeout = cx.new(|cx| TextInput::new("Silence timeout (seconds)", false, cx));
         let health_input_subscriptions = [
             cx.subscribe(&health_hz, |_, _, _: &Changed, cx| cx.notify()),
@@ -212,6 +213,7 @@ impl GraphView {
             design_project: None,
             overlay: RuntimeOverlay::default(),
             health_snapshot: HealthSnapshot::default(),
+            health_topics: Vec::new(),
             health_error: None,
             health_settings_error: None,
             health_topic: None,
@@ -556,6 +558,7 @@ impl GraphView {
     }
 
     fn rebuild_graph(&mut self, cx: &mut Context<Self>) {
+        self.refresh_health_watches(cx);
         let Some(design) = &self.design_project else {
             return;
         };
@@ -650,6 +653,7 @@ impl GraphView {
         self.connection_label = "Disconnected".into();
         self.overlay = RuntimeOverlay::default();
         self.health_snapshot = HealthSnapshot::default();
+        self.health_topics.clear();
         self.health_error = None;
         if self.auto_mode {
             self.mode = GraphMode::Design;
@@ -690,7 +694,7 @@ impl GraphView {
                     "Connected · discovery unavailable"
                 }
                 .into();
-                if discovery && !self.health_watches().is_empty() {
+                if discovery {
                     self.sync_health(cx);
                 }
                 if let Some(execution) = self.queued.take() {
@@ -770,6 +774,7 @@ impl GraphView {
                 }
                 self.overlay = RuntimeOverlay::default();
                 self.health_snapshot = HealthSnapshot::default();
+                self.health_topics.clear();
                 self.health_error = None;
                 self.connection_label = "Disconnected".into();
                 if self.auto_mode {
@@ -1160,9 +1165,9 @@ impl GraphView {
                         selectable_button(
                             "runtime-health",
                             if health_alerts == 0 {
-                                "Health".to_owned()
+                                "Monitor".to_owned()
                             } else {
-                                format!("Health · {health_alerts} alerts")
+                                format!("Monitor · {health_alerts} alerts")
                             },
                             self.inspector_view == InspectorView::Health,
                         )
@@ -2132,7 +2137,7 @@ impl GraphView {
                                                 }
                                                 .to_owned()
                                             },
-                                            |state| state.label().to_owned(),
+                                            |state| format!("ONLINE · {}", state.label()),
                                         )),
                                 ),
                         )

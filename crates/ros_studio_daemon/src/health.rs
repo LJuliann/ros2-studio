@@ -37,7 +37,7 @@ impl TopicMeter {
     }
 
     pub fn report(&mut self, now: Duration) -> TopicHealth {
-        let timeout = Duration::from_millis(self.watch.timeout_ms);
+        let mut timeout = Duration::from_millis(self.watch.timeout_ms);
         let cutoff = now.saturating_sub(Duration::from_secs(5));
         // Keep a preceding sample for the boundary interval, including slow topics.
         while self.samples.len() > 2 && self.samples[1] < cutoff {
@@ -53,6 +53,13 @@ impl TopicMeter {
                     (self.samples.len() >= 2 && seconds > 0.0)
                         .then(|| (self.samples.len() - 1) as f64 / seconds)
                 });
+        // A slow periodic topic must not turn red between normal publications.
+        // Explicit thresholds keep the user's chosen silence deadline.
+        if self.watch.expected_hz.is_none()
+            && let Some(hz) = observed_hz.filter(|hz| *hz > 0.0)
+        {
+            timeout = timeout.max(Duration::from_secs_f64((3.0 / hz).min(600.0)));
+        }
         let (state, detail, observed_hz) = if let Some(error) = &self.error {
             (TopicHealthState::Unavailable, error.clone(), None)
         } else if age.is_some_and(|age| age >= timeout)
@@ -70,8 +77,14 @@ impl TopicMeter {
                 "Collecting arrival-time samples".into(),
                 observed_hz,
             )
-        } else if observed_hz.is_some_and(|hz| {
-            (hz - self.watch.expected_hz).abs() <= self.watch.expected_hz * self.watch.tolerance
+        } else if self.watch.expected_hz.is_none() {
+            (
+                TopicHealthState::Healthy,
+                "Messages received; no expected rate configured".into(),
+                observed_hz,
+            )
+        } else if self.watch.expected_hz.is_some_and(|expected| {
+            observed_hz.is_some_and(|hz| (hz - expected).abs() <= expected * self.watch.tolerance)
         }) {
             (
                 TopicHealthState::Healthy,
@@ -105,7 +118,7 @@ mod tests {
             TopicWatch {
                 topic: "/imu".into(),
                 type_name: "sensor_msgs/msg/Imu".into(),
-                expected_hz: 200.0,
+                expected_hz: Some(200.0),
                 tolerance: 0.2,
                 timeout_ms: 3000,
             },
@@ -155,7 +168,7 @@ mod tests {
     #[test]
     fn handles_low_rates_bounded_history_duplicate_times_and_missing_type_support() {
         let mut meter = meter();
-        meter.watch.expected_hz = 0.1;
+        meter.watch.expected_hz = Some(0.1);
         meter.watch.timeout_ms = 30_000;
         meter.record(Duration::ZERO);
         meter.record(Duration::from_secs(10));
@@ -175,6 +188,44 @@ mod tests {
         assert_eq!(
             meter.report(Duration::from_secs(50)).state,
             TopicHealthState::Unavailable
+        );
+    }
+
+    #[test]
+    fn automatic_monitoring_measures_silence_and_recovery_without_a_target() {
+        let mut meter = meter();
+        meter.watch.expected_hz = None;
+        for time in (0..=6000).step_by(50) {
+            meter.record(Duration::from_millis(time));
+        }
+        let report = meter.report(Duration::from_secs(6));
+        assert_eq!(report.state, TopicHealthState::Healthy);
+        assert_eq!(report.observed_hz, Some(20.0));
+        let report = meter.report(Duration::from_secs(9));
+        assert_eq!(report.state, TopicHealthState::Missing);
+        assert_eq!(report.observed_hz, Some(0.0));
+        for time in (9000..=15000).step_by(50) {
+            meter.record(Duration::from_millis(time));
+        }
+        assert_eq!(
+            meter.report(Duration::from_secs(15)).state,
+            TopicHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn automatic_silence_deadline_adapts_to_slow_topics() {
+        let mut meter = meter();
+        meter.watch.expected_hz = None;
+        meter.record(Duration::ZERO);
+        meter.record(Duration::from_secs(10));
+        assert_eq!(
+            meter.report(Duration::from_secs(29)).state,
+            TopicHealthState::Healthy
+        );
+        assert_eq!(
+            meter.report(Duration::from_secs(40)).state,
+            TopicHealthState::Missing
         );
     }
 }

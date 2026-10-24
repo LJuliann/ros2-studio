@@ -6,19 +6,23 @@ use std::collections::BTreeSet;
 use ros_studio_model::EntityId;
 use serde::{Deserialize, Serialize};
 
+pub const MAX_TOPIC_WATCHES: usize = 256;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopicWatch {
     pub topic: String,
     pub type_name: String,
-    pub expected_hz: f64,
+    /// None measures activity automatically, without assuming a target rate.
+    #[serde(default)]
+    pub expected_hz: Option<f64>,
     pub tolerance: f64,
     pub timeout_ms: u64,
 }
 
 pub fn validate_watches(watches: &[TopicWatch]) -> Result<(), String> {
-    if watches.len() > 32 {
-        return Err("Monitor at most 32 important topics".into());
+    if watches.len() > MAX_TOPIC_WATCHES {
+        return Err(format!("Monitor at most {MAX_TOPIC_WATCHES} topics"));
     }
     let mut names = BTreeSet::new();
     for watch in watches {
@@ -42,15 +46,19 @@ pub fn validate_watches(watches: &[TopicWatch]) -> Result<(), String> {
             || parts[1] != "msg"
             || !valid_component(parts[0])
             || !valid_component(parts[2])
-            || !watch.expected_hz.is_finite()
-            || !(0.0 < watch.expected_hz && watch.expected_hz <= 100_000.0)
+            || watch
+                .expected_hz
+                .is_some_and(|hz| !hz.is_finite() || !(0.0 < hz && hz <= 100_000.0))
             || !watch.tolerance.is_finite()
             || !(0.0..1.0).contains(&watch.tolerance)
             || !(100..=600_000).contains(&watch.timeout_ms)
         {
             return Err(format!("Invalid monitoring settings for {}", watch.topic));
         }
-        if watch.timeout_ms as f64 <= 1000.0 / watch.expected_hz {
+        if watch
+            .expected_hz
+            .is_some_and(|hz| watch.timeout_ms as f64 <= 1000.0 / hz)
+        {
             return Err(format!(
                 "Silence timeout for {} must exceed its normal message interval",
                 watch.topic
@@ -73,10 +81,10 @@ pub enum TopicHealthState {
 impl TopicHealthState {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Waiting => "WAITING",
-            Self::Healthy => "RATE OK",
+            Self::Waiting => "MEASURING",
+            Self::Healthy => "PUBLISHING",
             Self::Degraded => "RATE WARNING",
-            Self::Missing => "NO DATA",
+            Self::Missing => "SILENT",
             Self::Unavailable => "UNAVAILABLE",
         }
     }
@@ -108,7 +116,7 @@ mod tests {
         TopicWatch {
             topic: "/camera/image".into(),
             type_name: "sensor_msgs/msg/Image".into(),
-            expected_hz: 30.0,
+            expected_hz: Some(30.0),
             tolerance: 0.2,
             timeout_ms: 3000,
         }
@@ -138,7 +146,7 @@ mod tests {
         for hz in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(
                 validate_watches(&[TopicWatch {
-                    expected_hz: hz,
+                    expected_hz: Some(hz),
                     ..watch()
                 }])
                 .is_err()
@@ -167,7 +175,7 @@ mod tests {
         );
         assert!(
             validate_watches(&[TopicWatch {
-                expected_hz: 0.1,
+                expected_hz: Some(0.1),
                 timeout_ms: 3000,
                 ..watch()
             }])
@@ -175,19 +183,37 @@ mod tests {
         );
         assert!(
             validate_watches(&[TopicWatch {
-                expected_hz: 0.1,
+                expected_hz: Some(0.1),
                 timeout_ms: 30000,
                 ..watch()
             }])
             .is_ok()
         );
-        let many = (0..33)
+        let many = (0..=MAX_TOPIC_WATCHES)
             .map(|i| TopicWatch {
                 topic: format!("/topic_{i}"),
                 ..watch()
             })
             .collect::<Vec<_>>();
         assert!(validate_watches(&many).is_err());
+    }
+
+    #[test]
+    fn accepts_automatic_monitoring_and_existing_saved_thresholds() {
+        let automatic = TopicWatch {
+            expected_hz: None,
+            ..watch()
+        };
+        assert!(validate_watches(&[automatic.clone()]).is_ok());
+        let json = serde_json::to_value(watch()).unwrap();
+        assert_eq!(json["expected_hz"], 30.0);
+        assert_eq!(serde_json::from_value::<TopicWatch>(json).unwrap(), watch());
+        let mut json = serde_json::to_value(&automatic).unwrap();
+        json.as_object_mut().unwrap().remove("expected_hz");
+        assert_eq!(
+            serde_json::from_value::<TopicWatch>(json).unwrap(),
+            automatic
+        );
     }
 
     #[test]

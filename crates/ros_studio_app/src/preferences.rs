@@ -138,7 +138,7 @@ mod tests {
             vec![TopicWatch {
                 topic: "/imu".into(),
                 type_name: "sensor_msgs/msg/Imu".into(),
-                expected_hz: 200.0,
+                expected_hz: Some(200.0),
                 tolerance: 0.2,
                 timeout_ms: 3000,
             }],

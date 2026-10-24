@@ -381,7 +381,7 @@ mod tests {
                 let watch = TopicWatch {
                     topic: "/imu".into(),
                     type_name: "sensor_msgs/msg/Imu".into(),
-                    expected_hz: 200.0,
+                    expected_hz: Some(200.0),
                     tolerance: 0.2,
                     timeout_ms: 3000,
                 };
@@ -527,7 +527,7 @@ while read -r request; do :; done
                             handle.send(ClientCommand::ConfigureHealth(vec![TopicWatch {
                                 topic: topic.clone(),
                                 type_name: "std_msgs/msg/String".into(),
-                                expected_hz: 20.0,
+                                expected_hz: None,
                                 tolerance: 0.2,
                                 timeout_ms: 2000,
                             }]))?;

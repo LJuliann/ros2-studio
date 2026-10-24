@@ -1,8 +1,12 @@
 //! Honest display of monitoring evidence: never attribute an aggregated topic's
 //! rate to one of several publishers, or keep a green badge after reports stop.
 
-use ros_studio_model::{EndpointKind, EntityId, Node, Project, RuntimeState};
-use ros_studio_protocol::health::{HealthReport, TopicHealth, TopicHealthState, TopicWatch};
+use ros_studio_model::{
+    EndpointKind, EntityId, Node, Project, RuntimeState, design_live::canonical_ros_type_name,
+};
+use ros_studio_protocol::health::{
+    HealthReport, MAX_TOPIC_WATCHES, TopicHealth, TopicHealthState, TopicWatch, validate_watches,
+};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -16,6 +20,83 @@ pub struct HealthSnapshot {
 
 pub fn absolute_topic(topic: &str) -> String {
     format!("/{}", topic.trim_start_matches('/'))
+}
+
+/// Keep discovered topics for the session, so disappearing publishers remain
+/// visible as silent. User thresholds take priority over automatic settings.
+pub fn automatic_watches(
+    project: &Project,
+    saved: &[TopicWatch],
+    previous: &[TopicWatch],
+) -> Vec<TopicWatch> {
+    let mut discovered = BTreeMap::new();
+    for watch in previous {
+        discovered.insert(
+            watch.topic.clone(),
+            TopicWatch {
+                expected_hz: None,
+                tolerance: 0.2,
+                timeout_ms: 5000,
+                ..watch.clone()
+            },
+        );
+    }
+    for endpoint in project
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.runtime_state,
+                RuntimeState::Online | RuntimeState::RuntimeOnly | RuntimeState::Conflict
+            )
+        })
+        .flat_map(|node| &node.endpoints)
+        .filter(|endpoint| endpoint.kind == EndpointKind::Publisher)
+    {
+        let topic = absolute_topic(&endpoint.name);
+        if matches!(topic.as_str(), "/rosout" | "/parameter_events") {
+            continue;
+        }
+        let watch = TopicWatch {
+            topic: topic.clone(),
+            type_name: canonical_ros_type_name(&endpoint.type_name),
+            expected_hz: None,
+            tolerance: 0.2,
+            timeout_ms: 5000,
+        };
+        if validate_watches(std::slice::from_ref(&watch)).is_ok() {
+            discovered.insert(topic, watch);
+        }
+    }
+    let mut watches: BTreeMap<_, _> = saved
+        .iter()
+        .filter(|watch| validate_watches(std::slice::from_ref(*watch)).is_ok())
+        .take(MAX_TOPIC_WATCHES)
+        .map(|watch| (watch.topic.clone(), watch.clone()))
+        .collect();
+    for (topic, watch) in discovered {
+        if watches.len() >= MAX_TOPIC_WATCHES {
+            break;
+        }
+        watches.entry(topic).or_insert(watch);
+    }
+    watches.into_values().collect()
+}
+
+pub fn publisher_count(project: &Project, topic: &str) -> usize {
+    project
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.runtime_state,
+                RuntimeState::Online | RuntimeState::RuntimeOnly | RuntimeState::Conflict
+            ) && node.endpoints.iter().any(|endpoint| {
+                endpoint.kind == EndpointKind::Publisher
+                    && absolute_topic(&endpoint.name) == absolute_topic(topic)
+            })
+        })
+        .count()
 }
 
 impl HealthSnapshot {
@@ -88,21 +169,7 @@ impl HealthSnapshot {
             })
             .map(|endpoint| {
                 let topic = absolute_topic(&endpoint.name);
-                let publishers = project
-                    .nodes
-                    .iter()
-                    .filter(|candidate| {
-                        matches!(
-                            candidate.runtime_state,
-                            RuntimeState::Online
-                                | RuntimeState::RuntimeOnly
-                                | RuntimeState::Conflict
-                        ) && candidate.endpoints.iter().any(|endpoint| {
-                            endpoint.kind == EndpointKind::Publisher
-                                && absolute_topic(&endpoint.name) == topic
-                        })
-                    })
-                    .count();
+                let publishers = publisher_count(project, &topic);
                 if publishers == 1 {
                     self.get(&topic, now)
                         .map_or(TopicHealthState::Waiting, |report| report.state)
@@ -124,6 +191,91 @@ impl HealthSnapshot {
 mod tests {
     use super::*;
 
+    fn discovered_project() -> Project {
+        use ros_studio_model::{Confidence, Endpoint};
+        Project {
+            id: EntityId::new("project:auto"),
+            name: "auto".into(),
+            root_path: "/auto".into(),
+            packages: vec![],
+            nodes: vec![Node {
+                id: EntityId::new("node:camera"),
+                logical_name: "camera".into(),
+                package_id: EntityId::new("package:runtime"),
+                executable: String::new(),
+                source_locations: vec![],
+                evidence: vec![],
+                runtime_state: RuntimeState::RuntimeOnly,
+                endpoints: ["/image", "/rosout", "/parameter_events"]
+                    .into_iter()
+                    .map(|topic| Endpoint {
+                        id: EntityId::new(topic),
+                        kind: EndpointKind::Publisher,
+                        name: topic.into(),
+                        type_name: "sensor_msgs/msg/Image".into(),
+                        source_location: None,
+                        confidence: Confidence::RuntimeConfirmed,
+                        evidence: vec![],
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn discovers_topics_without_settings_and_keeps_disappeared_publishers_visible() {
+        let mut project = discovered_project();
+        let watches = automatic_watches(&project, &[], &[]);
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].topic, "/image");
+        assert_eq!(watches[0].expected_hz, None);
+        assert!(validate_watches(&watches).is_ok());
+        project.nodes.clear();
+        assert_eq!(automatic_watches(&project, &[], &watches), watches);
+        assert!(automatic_watches(&project, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn saved_thresholds_override_automatic_rates_and_reset_without_removing_the_topic() {
+        let mut project = discovered_project();
+        let auto = automatic_watches(&project, &[], &[]);
+        let manual = TopicWatch {
+            expected_hz: Some(30.0),
+            ..auto[0].clone()
+        };
+        let watches = automatic_watches(&project, std::slice::from_ref(&manual), &auto);
+        assert_eq!(watches, vec![manual]);
+        assert_eq!(automatic_watches(&project, &[], &watches), auto);
+        project.nodes[0].endpoints[0].kind = EndpointKind::Subscription;
+        assert!(automatic_watches(&project, &[], &[]).is_empty());
+        project.nodes[0].endpoints[0].kind = EndpointKind::Publisher;
+        project.nodes[0].runtime_state = RuntimeState::Offline;
+        assert!(automatic_watches(&project, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn bounds_automatic_subscriptions_and_prioritizes_saved_topics() {
+        let mut project = discovered_project();
+        let endpoint = project.nodes[0].endpoints[0].clone();
+        project.nodes[0].endpoints = (0..=MAX_TOPIC_WATCHES)
+            .map(|i| ros_studio_model::Endpoint {
+                name: format!("/topic_{i}"),
+                ..endpoint.clone()
+            })
+            .collect();
+        let saved = TopicWatch {
+            topic: "/zzz_important".into(),
+            type_name: endpoint.type_name,
+            expected_hz: Some(30.0),
+            tolerance: 0.2,
+            timeout_ms: 5000,
+        };
+        let watches = automatic_watches(&project, std::slice::from_ref(&saved), &[]);
+        assert_eq!(watches.len(), MAX_TOPIC_WATCHES);
+        assert!(watches.contains(&saved));
+        assert!(validate_watches(&watches).is_ok());
+    }
+
     #[test]
     fn only_attributes_unique_publisher_evidence_and_never_subscriber_processing() {
         use ros_studio_model::{Confidence, Endpoint};
@@ -131,7 +283,7 @@ mod tests {
         let watch = TopicWatch {
             topic: "/imu".into(),
             type_name: "sensor_msgs/msg/Imu".into(),
-            expected_hz: 200.0,
+            expected_hz: Some(200.0),
             tolerance: 0.2,
             timeout_ms: 3000,
         };
@@ -213,7 +365,7 @@ mod tests {
             None
         );
         let changed = TopicWatch {
-            expected_hz: 100.0,
+            expected_hz: Some(100.0),
             ..watch
         };
         snapshot.apply(
@@ -235,7 +387,7 @@ mod tests {
         let watch = TopicWatch {
             topic: "/imu".into(),
             type_name: "sensor_msgs/msg/Imu".into(),
-            expected_hz: 200.0,
+            expected_hz: Some(200.0),
             tolerance: 0.2,
             timeout_ms: 3000,
         };

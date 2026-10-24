@@ -306,16 +306,23 @@ keep your selected mode. Both retains static nodes and marks nodes not found
 in the live snapshot as Offline. Live may correctly be empty if nothing runs
 in the current ROS domain.
 
-**Health** opens the monitoring inspector. Choose an available topic, enter
-its expected Hz and a silence timeout, then **Save and monitor**. Settings are
-stored per project in application preferences, not in your source files. Saving
-starts a runtime connection if needed; saved watches resume on the next connection.
-Only explicitly selected topics are subscribed to (maximum 32).
+**Monitor** opens the live frequency inspector. Connecting to ROS automatically
+monitors discovered publisher topics and shows each topic's received Hz and status.
+New topics are added during the session; topics whose publishers disappear remain
+visible so silence can be detected. `/rosout` and `/parameter_events` are excluded
+from automatic selection. Up to 256 topics are measured, with saved thresholds
+taking priority; the inspector shows when this limit is reached.
 
-- **RATE OK**: received rate is within ±20% of the configured expectation.
+No expected frequency is required. Click a topic to optionally set expected Hz
+and a silence timeout, then **Save thresholds**. Settings are saved per project
+in application preferences. **Reset to automatic** clears those settings while
+keeping the topic monitored. The automatic silence deadline starts at five seconds
+and extends to three observed message intervals for slow periodic topics.
+
+- **PUBLISHING**: messages are arriving; with an expected rate, it is within ±20%.
 - **RATE WARNING**: received rate is too low or too high.
-- **NO DATA**: no message arrived before the configured silence deadline.
-- **WAITING / UNKNOWN / UNAVAILABLE**: warming up, disconnected/stale observer,
+- **SILENT**: no message arrived before the silence deadline; the displayed rate is 0 Hz.
+- **MEASURING / UNKNOWN / UNAVAILABLE**: warming up, disconnected/stale observer,
   unsupported daemon, or missing message introspection/type support. These are
   not reported as node crashes.
 
@@ -323,7 +330,7 @@ The observer uses monotonic arrival times, a five-second rolling sample window,
 bounded memory, and best-effort/volatile subscriptions. It runs inside the same
 ROS daemon/environment as discovery, on Host or Docker, and receives data without
 publishing commands. This adds subscription/network/serialization load, especially
-for images: monitor important topics only. QoS and system load can affect the
+for images. QoS and system load can affect the
 received rate; it is not necessarily the publisher's true rate or proof of correct
 processing. Very slow topics require a timeout longer than their normal interval.
 
@@ -332,7 +339,8 @@ planned nodes absent from discovery. A topic's aggregated rate is never attribut
 to an individual node when several publishers share it, nor taken as proof that
 a subscriber processes its inputs. Green observations expire if reports stop;
 disconnecting or switching projects clears measurements. Closing the Health panel
-only hides it; **Stop watching** removes the selected subscription.
+only hides it. The inspector lists node presence separately from the received
+frequencies of each output topic; a node has no single universal frequency.
 
 This feature requires rebuilding **both the app and the ROS runtime daemon**.
 The ROS-free unit tests exercise rates/thresholds, silence/recovery, bounded memory,
